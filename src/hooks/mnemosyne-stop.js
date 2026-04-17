@@ -48,6 +48,7 @@ const ASSUMPTION_PATTERNS = [
 ];
 
 function extractTextFromMessage(d) {
+  // d.message?.content is the Claude Code JSONL format; d.content is a legacy fallback
   const content = d.message?.content ?? d.content;
   if (!content) return '';
   if (typeof content === 'string') return content;
@@ -88,7 +89,8 @@ function scanTranscript(transcriptPath) {
     }
   }
 
-  return candidates;
+  // Cap to avoid excessive processing on very long sessions
+  return candidates.slice(0, 30);
 }
 
 function getSessionId(transcriptPath) {
@@ -96,6 +98,7 @@ function getSessionId(transcriptPath) {
 }
 
 function findProjectDir(cwd) {
+  // Walk up the directory tree — sessions may run in subdirs of the project root
   let current = cwd;
   while (current && current !== path.dirname(current)) {
     const encoded = current.replace(/\//g, '-');
@@ -134,35 +137,33 @@ scope: project:${projectName}
 
 function isDuplicate(existingContent, normalized) {
   const lower = normalized.toLowerCase();
-  return existingContent.toLowerCase().includes(lower.slice(0, 50));
+  return existingContent.toLowerCase().includes(lower.slice(0, 80));
 }
 
 function appendAssumptions(assumptionsPath, newCandidates, sessionId, projectName) {
-  let content = readAssumptions(assumptionsPath);
-  let created = false;
+  const memDir = path.dirname(assumptionsPath);
+  const fileExists = fs.existsSync(assumptionsPath);
 
-  if (!content) {
-    content = buildInitialFile(projectName);
-    created = true;
+  if (!fileExists) {
+    // Create initial file with frontmatter + section header
+    if (!fs.existsSync(memDir)) fs.mkdirSync(memDir, { recursive: true });
+    fs.writeFileSync(assumptionsPath, buildInitialFile(projectName));
   }
 
-  if (!content.includes('## Active Assumptions')) {
-    content += '\n## Active Assumptions\n\n';
-  }
+  // Read current content for deduplication check
+  const currentContent = readAssumptions(assumptionsPath) || '';
 
   let added = 0;
   for (const { normalized, category } of newCandidates) {
-    if (isDuplicate(content, normalized)) continue;
+    if (isDuplicate(currentContent, normalized)) continue;
     const entry = `- [${TODAY}] (${category}) ${normalized} (session:${sessionId})\n`;
-    content += entry;
+    fs.appendFileSync(assumptionsPath, entry);
     added++;
   }
 
-  if (created || added > 0) {
-    const memDir = path.dirname(assumptionsPath);
-    if (!fs.existsSync(memDir)) fs.mkdirSync(memDir, { recursive: true });
-    fs.writeFileSync(assumptionsPath, content);
-    process.stderr.write(`[Mnemosyne] assumptions: +${added} entries (${created ? 'created' : 'updated'}) → ${assumptionsPath}\n`);
+  if (!fileExists || added > 0) {
+    const action = !fileExists ? 'created' : 'updated';
+    process.stderr.write(`[Mnemosyne] assumptions: +${added} entries (${action}) → ${assumptionsPath}\n`);
   }
 }
 
