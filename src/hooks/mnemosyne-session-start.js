@@ -127,7 +127,7 @@ function loadTopAssumptions(projectDir, maxCount) {
     return [];
   }
 
-  const sectionMatch = content.match(/## Active Assumptions\n([\s\S]*?)(?=\n##|\s*$)/);
+  const sectionMatch = content.match(/## Active Assumptions\n([\s\S]*?)(?=\n##|$)/);
   if (!sectionMatch) return [];
 
   const lines = sectionMatch[1]
@@ -155,7 +155,11 @@ function main() {
     .filter(({ content }) => isValid(content))
     .slice(0, 50);
 
-  if (tier0Files.length === 0 && tier1Files.length === 0) {
+  const cwd = (event && event.cwd) ? event.cwd : process.cwd();
+  const projectDir = findProjectDir(cwd);
+  const assumptionLines = projectDir ? loadTopAssumptions(projectDir, 3) : [];
+
+  if (tier0Files.length === 0 && tier1Files.length === 0 && assumptionLines.length === 0) {
     process.stdout.write(raw);
     return;
   }
@@ -172,24 +176,18 @@ function main() {
   }
 
   if (tier1Files.length > 0 && remainingChars > 0) {
-    const { text } = buildSection(1, tier1Files, remainingChars);
+    const { text, charsUsed } = buildSection(1, tier1Files, remainingChars);
     if (text) {
       sections.push(`## Tier 1 — Global Feedback Memory\n\n${text}`);
+      remainingChars -= charsUsed;
     }
   }
 
-  const cwd = (event && event.cwd) ? event.cwd : process.cwd();
-  const projectDir = findProjectDir(cwd);
-
-  let assumptionLines = [];
-  if (projectDir && remainingChars > 0) {
-    assumptionLines = loadTopAssumptions(projectDir, 3);
-    if (assumptionLines.length > 0) {
-      const assumptionText = `## Active Assumptions (Project)\n\n${assumptionLines.join('\n')}`;
-      if (assumptionText.length <= remainingChars && assumptionText.length <= 1200) {
-        sections.push(assumptionText);
-        remainingChars -= assumptionText.length;
-      }
+  if (assumptionLines.length > 0 && remainingChars > 0) {
+    const assumptionText = `## Active Assumptions (Project)\n\n${assumptionLines.join('\n')}`;
+    if (assumptionText.length <= remainingChars && assumptionText.length <= 1200) {
+      sections.push(assumptionText);
+      remainingChars -= assumptionText.length;
     }
   }
 
