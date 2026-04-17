@@ -135,6 +135,14 @@ if (content.includes(OLD_BLOCK)) {
 PATCH_EOF
 fi
 
+# Step 7: Deploy /mnemosyne dream skill
+echo "[7/7] Deploying /mnemosyne dream skill..."
+mkdir -p "$HOME/.claude/skills/mnemosyne"
+cp "$MNEMOSYNE_DIR/src/dream/SKILL.md" "$HOME/.claude/skills/mnemosyne/"
+cp "$MNEMOSYNE_DIR/src/dream/dream-gather.js" "$HOME/.claude/skills/mnemosyne/"
+cp "$MNEMOSYNE_DIR/src/dream/dream-evict.js" "$HOME/.claude/skills/mnemosyne/"
+echo "  ~/.claude/skills/mnemosyne/ — OK (SKILL.md, dream-gather.js, dream-evict.js)"
+
 echo ""
 echo "=== Installation complete ==="
 echo ""
@@ -146,3 +154,4 @@ echo "  2. Restart Claude Code to activate the new SessionStart hook"
 echo ""
 echo "  3. Verify in any session:"
 echo "     /memory-status"
+echo "     /mnemosyne    (run dream consolidation)"
