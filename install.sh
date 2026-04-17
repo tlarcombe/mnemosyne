@@ -136,12 +136,43 @@ PATCH_EOF
 fi
 
 # Step 7: Deploy /mnemosyne dream skill
-echo "[7/7] Deploying /mnemosyne dream skill..."
+echo "[7/8] Deploying /mnemosyne dream skill..."
 mkdir -p "$HOME/.claude/skills/mnemosyne"
 cp "$MNEMOSYNE_DIR/src/dream/SKILL.md" "$HOME/.claude/skills/mnemosyne/"
 cp "$MNEMOSYNE_DIR/src/dream/dream-gather.js" "$HOME/.claude/skills/mnemosyne/"
 cp "$MNEMOSYNE_DIR/src/dream/dream-evict.js" "$HOME/.claude/skills/mnemosyne/"
 echo "  ~/.claude/skills/mnemosyne/ — OK (SKILL.md, dream-gather.js, dream-evict.js)"
+
+# Step 8: Deploy mnemosyne-stop.js and wire as async Stop hook
+echo "[8/8] Wiring Mnemosyne Stop hook (assumption extractor)..."
+cp "$MNEMOSYNE_DIR/src/hooks/mnemosyne-stop.js" "$HOOKS_DIR/"
+echo "  ~/.claude/scripts/hooks/mnemosyne-stop.js — OK"
+
+node -e "
+const fs = require('fs');
+const p = process.env.HOME + '/.claude/settings.json';
+const s = JSON.parse(fs.readFileSync(p, 'utf8'));
+const hookCmd = 'node \"' + process.env.HOME + '/.claude/scripts/hooks/mnemosyne-stop.js\"';
+const hook = {
+  matcher: '*',
+  hooks: [{ type: 'command', command: hookCmd }],
+  description: 'Mnemosyne: extract implicit assumptions from session transcript',
+  id: 'mnemosyne:stop:assumptions',
+  async: true,
+  timeout: 30
+};
+const existing = s.hooks.Stop || [];
+const idx = existing.findIndex(h => h.id === 'mnemosyne:stop:assumptions');
+if (idx >= 0) {
+  existing[idx] = hook;
+  s.hooks.Stop = existing;
+  console.log('  Updated existing mnemosyne:stop:assumptions hook');
+} else {
+  s.hooks.Stop = [...existing, hook];
+  console.log('  Wired: mnemosyne:stop:assumptions added as Stop hook');
+}
+fs.writeFileSync(p, JSON.stringify(s, null, 2) + '\n');
+"
 
 echo ""
 echo "=== Installation complete ==="
