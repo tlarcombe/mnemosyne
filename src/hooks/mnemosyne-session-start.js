@@ -106,6 +106,38 @@ function buildSection(tier, files, charBudget) {
   return { text: parts.join('\n\n'), charsUsed };
 }
 
+function findProjectDir(cwd) {
+  // Walk up the directory tree — sessions may run in subdirs of the project root
+  let current = cwd;
+  while (current && current !== path.dirname(current)) {
+    const encoded = current.replace(/\//g, '-');
+    const projectDir = path.join(CLAUDE_DIR, 'projects', encoded);
+    if (fs.existsSync(projectDir)) return projectDir;
+    current = path.dirname(current);
+  }
+  return null;
+}
+
+function loadTopAssumptions(projectDir, maxCount) {
+  const assumptionsPath = path.join(projectDir, 'memory', 'assumptions.md');
+  let content;
+  try {
+    content = fs.readFileSync(assumptionsPath, 'utf8');
+  } catch {
+    return [];
+  }
+
+  const sectionMatch = content.match(/## Active Assumptions\n([\s\S]*?)(?=\n##|\s*$)/);
+  if (!sectionMatch) return [];
+
+  const lines = sectionMatch[1]
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.startsWith('- ['));
+
+  return lines.slice(-maxCount);
+}
+
 function main() {
   const raw = fs.readFileSync(0, 'utf8');
 
@@ -146,11 +178,25 @@ function main() {
     }
   }
 
-  const totalTokens = estimateTokens(sections.join('\n\n'));
   const cwd = (event && event.cwd) ? event.cwd : process.cwd();
+  const projectDir = findProjectDir(cwd);
+
+  let assumptionLines = [];
+  if (projectDir && remainingChars > 0) {
+    assumptionLines = loadTopAssumptions(projectDir, 3);
+    if (assumptionLines.length > 0) {
+      const assumptionText = `## Active Assumptions (Project)\n\n${assumptionLines.join('\n')}`;
+      if (assumptionText.length <= remainingChars && assumptionText.length <= 1200) {
+        sections.push(assumptionText);
+        remainingChars -= assumptionText.length;
+      }
+    }
+  }
+
+  const totalTokens = estimateTokens(sections.join('\n\n'));
 
   process.stderr.write(
-    `[Mnemosyne] Tier 0: ${tier0Files.length} files | Tier 1: ${tier1Files.length} files | ~${totalTokens} tokens | cwd: ${cwd}\n`
+    `[Mnemosyne] Tier 0: ${tier0Files.length} files | Tier 1: ${tier1Files.length} files | Assumptions: ${assumptionLines.length} | ~${totalTokens} tokens | cwd: ${cwd}\n`
   );
 
   const additionalContext = sections.length > 0
