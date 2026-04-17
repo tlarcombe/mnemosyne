@@ -1,0 +1,319 @@
+# Mnemosyne — CIA-Grounded Memory Architecture for Claude Code
+## Project Brief for a New Claude Code Session
+
+---
+
+## Who You Are Working With
+
+The user (Tony Larcombe) has been running Claude Code across a NAS-mounted multi-machine lab
+(winifred being the primary Linux workstation). He has an enriched ~/.claude/ environment with
+38 agents, 85 skills, 74 commands, 16 rule directories, and 35 hook scripts.
+
+He has written a theoretical dissertation on exactly this problem:
+  /home/tlarcombe/projects/context_decay/docs/Conversation Intelligence Architecture.docx
+
+Read the full dissertation before you design anything. It is a rigorous theoretical framework
+for epistemic context management in LLMs. You are being asked to implement a practical version
+of it as the memory layer for his Claude Code environment.
+
+---
+
+## The Problem You Are Solving
+
+The current memory setup has several observable failures. Read all of the following before
+proceeding:
+
+### Current memory infrastructure (what exists):
+
+1. Native file-based memory at ~/.claude/projects/*/memory/
+   - Typed markdown files (user / feedback / project / reference)
+   - MEMORY.md index per project
+   - Auto-loaded into session context via system-reminder
+
+2. /dream skill at ~/.claude/skills/dream/
+   - Periodic memory consolidation triggered at session end
+   - Reads JSONL session files, extracts signal, writes to memory files
+   - Stop hook in ~/.claude/settings.json sets .dream-pending flag
+
+3. ECC session hooks:
+   - SessionStart: bootstrap.js loads previous context
+   - Stop: session-end.js, cost-tracker.js, evaluate-session.js
+   - PostToolUse: edit-accumulator.js
+
+4. Raw session storage:
+   - ~/.claude/projects/*/  contains JSONL session files — the verbatim journey
+   - Every message, tool call, and response is stored here
+
+5. claude-audit project at ~/projects/claude-audit — live view of session history
+
+### Current failures (the ones you must fix):
+
+**1. Context bleed between projects**
+The SessionStart bootstrap loads context that can include fragments from sessions in
+completely unrelated projects. The user sees text from the context_decay dissertation
+project appearing in a claude++ project session. Memory has no project isolation.
+
+**2. No scoped memory tiers**
+Everything goes into one flat memory/ directory per project. There is no distinction
+between:
+- Things that are true forever, about the user as a person (global permanent)
+- Things that are true across all projects (global feedback/preferences)
+- Things that are only true for this project (project-scope)
+- Things that were true in this session (session-scope)
+- Things that are no longer true at all (evicted / expired)
+
+**3. No eviction or decay policy**
+Memories accumulate indefinitely. The MEMORY.md index grows without pruning. There is
+no mechanism to mark a memory as stale, superseded, or no longer valid. The dissertation
+calls this the failure to implement valid time alongside transaction time (Chapter 8:
+Bitemporal Context Management).
+
+**4. No relevance scoring**
+All memories are treated as equally worth loading. There is no signal for which memories
+are relevant to the current task, project, or question. Everything in MEMORY.md gets
+loaded whether it is relevant or not.
+
+**5. /dream is incomplete and fragile**
+The dream skill was designed but runs inconsistently. It has no clear eviction strategy.
+It has no quality criterion for what a "good" consolidated memory looks like. The
+dissertation describes this as the absence of a Generative Competence Evaluator.
+
+**6. No assumption register**
+As conversations accumulate, premises accepted early become invisible background that
+shapes all subsequent reasoning. The dissertation calls this the frame accumulation
+problem (CIA Level 4: The Adversarial Frame Agent). The current system has no mechanism
+to surface implicit assumptions for audit.
+
+---
+
+## The Architecture You Are Building
+
+The project is called Mnemosyne (after the Greek goddess of memory and mother of the Muses).
+It is a memory management layer for Claude Code, grounded in the CIA framework from the
+dissertation. It is NOT a standalone application — it is a set of hooks, files, and skills
+that integrate with the existing ~/.claude/ infrastructure.
+
+### Memory Tiers (5 levels, each with distinct scope, retention policy, and eviction rules)
+
+**Tier 0 — Permanent/Global (never evicts)**
+Scope: user identity, cross-project preferences, long-term feedback corrections.
+Location: ~/.claude/memory/permanent/
+Loaded: always, in every session, prepended to system context.
+Eviction: manual only, by explicit user instruction.
+Examples: "Tony is an experienced developer", "always use bypassPermissions",
+          "don't trail-summarise responses", "deploy via GitHub not rsync"
+
+**Tier 1 — Global Feedback (slow decay, cross-project)**
+Scope: corrections and validated approaches that apply to all projects.
+Location: ~/.claude/memory/feedback/
+Loaded: always, after Tier 0.
+Eviction: after 90 days without reinforcement, or when explicitly superseded.
+Examples: "don't format Stop hooks as bare command objects",
+          "use --name flag not OSC2 for window titles"
+
+**Tier 2 — Project Memory (project-scoped, medium decay)**
+Scope: technical decisions, architecture choices, active goals for this project.
+Location: ~/.claude/projects/<encoded-path>/memory/
+Loaded: when working in the relevant project directory.
+Eviction: after 30 days without reference, or when marked superseded.
+Examples: "this project uses bypassPermissions", "the fzf picker is in claude++"
+
+**Tier 3 — Session Memory (session-scoped, short decay)**
+Scope: what we decided, built, or learned in recent sessions of this project.
+Location: ~/.claude/projects/<encoded-path>/memory/sessions/
+Loaded: most recent 3 sessions only, summarised not verbatim.
+Eviction: automatically after 7 days.
+Examples: session summaries, decisions made in the last few working sessions.
+
+**Tier 4 — Verbatim Archive (the journey, queryable not injected)**
+Scope: every session JSONL file — the full verbatim record.
+Location: already exists at ~/.claude/projects/*/
+Loaded: NOT injected into context. Queried on demand via a search command.
+Eviction: never (it is the audit trail).
+
+### The Key Design Constraint
+
+Tiers 0-2 are injected into context at session start (loaded). Tier 3 is injected
+selectively. Tier 4 is never injected — it is the raw source that /dream reads.
+
+This fixes context bleed: project-tier memories only load when the cwd matches.
+Global-tier memories load everywhere but are kept concise (< 2000 tokens total).
+
+### The Dream Cycle (Consolidation Engine)
+
+/dream is the consolidation engine. Rebuild it properly with this cycle:
+
+1. GATHER — read recent JSONL sessions (Tier 4)
+2. SCORE — apply a simplified version of the scoring architecture from Chapter 5:
+   - Recency: how recent is this signal?
+   - Relevance: does it fit an existing memory tier?
+   - Currency: is this still true? (check against current code/state)
+   - Confidence: how certain is the signal?
+3. PROMOTE — move high-scoring signal to the appropriate tier (0-3)
+4. EVICT — remove memories whose currency score has dropped below threshold
+5. INDEX — rebuild MEMORY.md index files for each tier
+
+The dream cycle should produce a run report at ~/.claude/memory/dream-last-run.md
+showing what was promoted, what was evicted, and what was left unchanged.
+
+### The Assumption Register (CIA Level 4 — Adversarial Frame)
+
+Implement a lightweight version of the adversarial frame agent as a periodic check.
+At session end (Stop hook), extract propositions the conversation treated as mutually
+accepted background without explicit statement. Write them to:
+  ~/.claude/projects/<encoded-path>/memory/assumptions.md
+
+Format: dated list of implicit premises. At session start, surface the top 3 most
+recently added assumptions so they can be challenged rather than silently inherited.
+
+### Bitemporal Awareness (CIA Chapter 8)
+
+Every memory entry must carry two temporal fields:
+  - recorded_at: when we wrote this memory (transaction time)
+  - valid_until: when this memory is expected to stop being true (valid time)
+
+Memories without explicit valid_until default to "indefinite" but still decay by tier.
+Forward commitments (things we plan to do) get a valid_until of the expected completion date.
+Corrected memories get the old entry's valid_until set to the correction date, not deleted.
+
+This means memory files use frontmatter:
+---
+name: ...
+type: feedback | user | project | reference
+recorded_at: 2026-04-17
+valid_until: indefinite | 2026-06-01 | superseded-2026-04-17
+scope: global | project:<name>
+---
+
+### The Context Injection Hook
+
+Rewrite the SessionStart bootstrap to:
+1. Load Tier 0 (permanent/global) — always
+2. Load Tier 1 (global feedback) — always, capped at 50 entries
+3. Load Tier 2 (project memory) — only if cwd matches project path
+4. Load Tier 3 (session summaries) — most recent 3 sessions for this project only
+5. Surface top 3 assumptions from assumptions.md for this project
+6. Report total token estimate for injected memory to stderr (for monitoring)
+
+Cap total injected memory at ~3000 tokens. If over, evict by tier priority (Tier 3 first).
+
+---
+
+## What to Read First
+
+Before writing a single line of code, read these files in this order:
+
+1. /home/tlarcombe/projects/context_decay/docs/Conversation Intelligence Architecture.docx
+   (use python3 with zipfile to extract the XML if the tool can't read docx directly)
+
+2. /home/tlarcombe/.claude/settings.json
+   (understand the existing hook structure — especially SessionStart, Stop, PostToolUse)
+
+3. /home/tlarcombe/.claude/skills/dream/  (the whole directory)
+   (understand what /dream currently does and where it falls short)
+
+4. /home/tlarcombe/.claude/projects/-home-tlarcombe-projects-claude--/memory/
+   (see the current state of memory files and the MEMORY.md index)
+
+5. /home/tlarcombe/.claude/scripts/hooks/session-start-bootstrap.js
+   (understand what currently loads context — this is where the bleed originates)
+
+6. /home/tlarcombe/projects/claude++/CLAUDE.md
+   (understand the overall claude++ architecture this must integrate with)
+
+---
+
+## What MemPalace Offers (and Why We're Not Using It)
+
+MemPalace (mempalace.tech) solves the same problem differently:
+- It stores conversations verbatim (we already have this in JSONL files)
+- It adds vector search via ChromaDB + SQLite (semantic query across all sessions)
+- It uses a hierarchical palace metaphor (Wings/Rooms/Halls/Drawers)
+
+We are NOT using MemPalace because:
+- The verbatim archive already exists in JSONL
+- ChromaDB adds a dependency and requires a local embedding model or API
+- The CIA-grounded approach is theoretically superior (it manages epistemic structure,
+  not just content)
+
+However: vector search for the Tier 4 archive IS worth implementing later, as a
+/memory-search command. Design the architecture so this can be added as a layer on top
+of the JSONL files without restructuring everything else. Mark it as Phase 2.
+
+---
+
+## Implementation Phases
+
+### Phase 1 — Foundations (implement first, must work before anything else)
+
+1. Define the memory frontmatter schema (recorded_at, valid_until, scope)
+2. Migrate existing ~/.claude/projects/*/memory/ files to the new schema
+3. Create ~/.claude/memory/permanent/ and ~/.claude/memory/feedback/ directories
+4. Migrate global memories from existing MEMORY.md files into permanent/ and feedback/
+5. Rewrite the SessionStart bootstrap to load tiers in order with isolation
+6. Add the token budget cap and tier-priority eviction at load time
+7. Write a /memory-status command that shows what's loaded, from which tier, token count
+
+### Phase 2 — Dream Rebuilt
+
+1. Rewrite /dream with the 5-phase cycle (gather/score/promote/evict/index)
+2. Implement the simplified scoring function (recency + relevance + currency + confidence)
+3. Implement bitemporal eviction (valid_until checking)
+4. Write the dream run report
+5. Update the Stop hook to trigger /dream correctly and reliably
+
+### Phase 3 — Assumption Register
+
+1. Implement the Stop hook that extracts implicit assumptions from session content
+2. Write to assumptions.md with dates
+3. Add assumption surfacing to the SessionStart injection
+
+### Phase 4 — Vector Search (optional, later)
+
+1. Add ChromaDB indexing of JSONL files as a background process
+2. Implement /memory-search <query> that runs semantic search over Tier 4
+3. Wire results into session context on demand, not automatic injection
+
+---
+
+## Success Criteria
+
+The implementation is working correctly when:
+
+1. No context bleed — fragments from other projects never appear in unrelated sessions
+2. Sessions start with < 3000 tokens of injected memory, all of it relevant
+3. /dream runs reliably, produces a report, and leaves MEMORY.md files clean and current
+4. /memory-status shows exactly what is loaded and why
+5. A question like "what did we decide about X?" can be answered without manual search
+6. Memories older than their tier's decay window are evicted automatically
+7. Corrections propagate correctly (old memory marked superseded, not deleted)
+8. The assumption register surfaces premises that have become invisible background
+
+---
+
+## Technical Constraints
+
+- Must integrate with the existing ~/.claude/settings.json hook system
+- Must work across all projects on the NAS-mounted ~/projects/ filesystem
+- Must be installable on additional lab machines (follows the claude++ pattern)
+- Should be added to the claude++ repo at ~/projects/claude++ so it syncs via NAS
+- No new external services required for Phase 1-3 (ChromaDB only in Phase 4)
+- All memory files remain human-readable markdown (no binary formats)
+- The implementation language for hooks is Node.js (matching the existing hooks)
+  or bash for simpler scripts
+
+---
+
+## One Last Thing
+
+The name "Mnemosyne" is intentional. In Greek mythology she is both the goddess of memory
+and the mother of the nine Muses. A memory system that governs what the AI knows is also
+the mother of everything the AI can create. Name the project directory mnemosyne/ and the
+main skill mnemosyne within ~/.claude/skills/.
+
+The dissertation you are reading is not background reading — it is the specification.
+The CIA framework described in Chapter 7 is the architecture you are building.
+The bitemporal extension in Chapter 8 is the temporal model you are implementing.
+The dissolution mechanism in Chapter 6 is what /dream becomes.
+
+Build it properly.
