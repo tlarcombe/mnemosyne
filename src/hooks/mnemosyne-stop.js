@@ -99,18 +99,21 @@ function getSessionId(transcriptPath) {
 
 function findProjectDir(cwd) {
   // Walk up the directory tree — sessions may run in subdirs of the project root
+  // Returns { projectDir, matchedCwd } so callers can derive a reliable project name
   let current = cwd;
   while (current && current !== path.dirname(current)) {
     const encoded = current.replace(/\//g, '-');
     const projectDir = path.join(CLAUDE_DIR, 'projects', encoded);
-    if (fs.existsSync(projectDir)) return projectDir;
+    if (fs.existsSync(projectDir)) return { projectDir, matchedCwd: current };
     current = path.dirname(current);
   }
   return null;
 }
 
-function getProjectName(projectDir) {
-  return path.basename(projectDir).replace(/^.*-/, '');
+function getProjectName(matchedCwd) {
+  // Derive the project name from the real filesystem path — avoids decoding ambiguity
+  // with hyphenated project names (e.g. 'my-project', 'four-square').
+  return path.basename(matchedCwd);
 }
 
 function readAssumptions(assumptionsPath) {
@@ -184,13 +187,14 @@ function main() {
     if (!transcriptPath || !fs.existsSync(transcriptPath)) return;
 
     const cwd = process.cwd();
-    const projectDir = findProjectDir(cwd);
-    if (!projectDir) {
+    const found = findProjectDir(cwd);
+    if (!found) {
       process.stderr.write(`[Mnemosyne] assumptions: no project dir found for cwd: ${cwd}\n`);
       return;
     }
 
-    const projectName = getProjectName(projectDir);
+    const { projectDir, matchedCwd } = found;
+    const projectName = getProjectName(matchedCwd);
     const assumptionsPath = path.join(projectDir, 'memory', 'assumptions.md');
     const sessionId = getSessionId(transcriptPath);
 

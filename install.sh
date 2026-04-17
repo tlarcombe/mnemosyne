@@ -17,14 +17,14 @@ echo "Target: $CLAUDE_DIR"
 echo ""
 
 # Step 1: Global tier directories
-echo "[1/6] Creating global memory tier directories..."
+echo "[1/8] Creating global memory tier directories..."
 mkdir -p "$MEMORY_DIR/permanent"
 mkdir -p "$MEMORY_DIR/feedback"
 echo "  ~/.claude/memory/permanent/ — OK"
 echo "  ~/.claude/memory/feedback/  — OK"
 
 # Step 2: Seed files (skip if already customised by the user)
-echo "[2/6] Deploying Tier 0 seed files..."
+echo "[2/8] Deploying Tier 0 seed files..."
 for seed in "$MNEMOSYNE_DIR/seeds/permanent/"*.md; do
   target="$MEMORY_DIR/permanent/$(basename "$seed")"
   if [[ ! -f "$target" ]]; then
@@ -36,17 +36,17 @@ for seed in "$MNEMOSYNE_DIR/seeds/permanent/"*.md; do
 done
 
 # Step 3: Mnemosyne SessionStart hook
-echo "[3/6] Deploying mnemosyne-session-start.js..."
+echo "[3/8] Deploying mnemosyne-session-start.js..."
 cp "$MNEMOSYNE_DIR/src/hooks/mnemosyne-session-start.js" "$HOOKS_DIR/"
 echo "  ~/.claude/scripts/hooks/mnemosyne-session-start.js — OK"
 
 # Step 4: /memory-status command
-echo "[4/6] Deploying memory-status command..."
+echo "[4/8] Deploying memory-status command..."
 cp "$MNEMOSYNE_DIR/src/commands/memory-status.md" "$COMMANDS_DIR/"
 echo "  ~/.claude/commands/memory-status.md — OK"
 
 # Step 5: Wire SessionStart hook in settings.json
-echo "[5/6] Wiring Mnemosyne SessionStart hook..."
+echo "[5/8] Wiring Mnemosyne SessionStart hook..."
 node -e "
 const fs = require('fs');
 const p = process.env.HOME + '/.claude/settings.json';
@@ -72,7 +72,7 @@ fs.writeFileSync(p, JSON.stringify(s, null, 2) + '\n');
 "
 
 # Step 6: Patch session-start.js to eliminate context bleed
-echo "[6/6] Applying context bleed fix to session-start.js..."
+echo "[6/8] Applying context bleed fix to session-start.js..."
 SESSION_START="$HOOKS_DIR/session-start.js"
 if grep -q 'Mnemosyne Tier-3 isolation' "$SESSION_START" 2>/dev/null; then
   echo "  Already patched — skipping"
@@ -155,11 +155,9 @@ const s = JSON.parse(fs.readFileSync(p, 'utf8'));
 const hookCmd = 'node \"' + process.env.HOME + '/.claude/scripts/hooks/mnemosyne-stop.js\"';
 const hook = {
   matcher: '*',
-  hooks: [{ type: 'command', command: hookCmd }],
+  hooks: [{ type: 'command', command: hookCmd, async: true, timeout: 30 }],
   description: 'Mnemosyne: extract implicit assumptions from session transcript',
   id: 'mnemosyne:stop:assumptions',
-  async: true,
-  timeout: 30
 };
 const existing = s.hooks.Stop || [];
 const idx = existing.findIndex(h => h.id === 'mnemosyne:stop:assumptions');
