@@ -1,0 +1,1503 @@
+#!/bin/bash
+# chloe — Project chooser with Mnemosyne memory.
+# Combines claude-project_chooser's fzf UI with claude++'s launch style.
+# Uses fzf for interactive selection and python3 for JSON parsing.
+
+set -euo pipefail
+
+USER_PROJECTS_DIR="$HOME/projects"
+CLAUDE_OUTPUT_LOG=$(mktemp /tmp/claude-session.XXXXXX)
+trap "rm -f '$CLAUDE_OUTPUT_LOG'" EXIT
+CONTINUE_STATE_FILE="$HOME/.claude/continue-state.json"
+
+# Base flags: always passed to claude. --add-dir makes ~/.claude hooks/memory available.
+BASE_CLAUDE_ARGS=(--permission-mode bypassPermissions --add-dir "$HOME/.claude")
+
+# Launch claude with automatic rate-limit retry.
+# Uses `script` to transparently capture terminal output.
+# After claude exits, checks for rate limit message. If found,
+# parses the reset time, sleeps until then, and relaunches with --continue.
+launch_claude() {
+    local claude_args=("${BASE_CLAUDE_ARGS[@]}" "$@")
+
+    local RATE_LIMIT_DEBUG="$HOME/.claude/rate-limit-debug.log"
+
+    while true; do
+        > "$CLAUDE_OUTPUT_LOG"  # clear previous capture
+        local _script_exit=0
+
+        # Background watcher: when Claude shows the rate-limit menu it waits for
+        # interactive input and never exits. Detect "/rate-limit-options" in the log
+        # and send Enter — option 1 ("Stop and wait") is pre-selected by default.
+        local WATCHER_PID=""
+        if [ -n "${TMUX_PANE:-}" ]; then
+            local _pane="$TMUX_PANE"
+            (
+                while sleep 3; do
+                    if tail -c 5000 "$CLAUDE_OUTPUT_LOG" 2>/dev/null | grep -q "rate-limit-options"; then
+                        sleep 60  # pause before dismissing so user can see the menu
+                        tmux send-keys -t "$_pane" "" Enter
+                        break
+                    fi
+                done
+            ) &
+            WATCHER_PID=$!
+        fi
+
+        script -qfc "claude ${claude_args[*]}" "$CLAUDE_OUTPUT_LOG" || _script_exit=$?
+        [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
+
+        # Strip ANSI/terminal codes using Python (handles UTF-8 middle dots, etc.)
+        # strings(1) breaks on non-ASCII chars like the · separator in rate-limit messages
+        local tail_output
+        tail_output=$(tail -c 50000 "$CLAUDE_OUTPUT_LOG" | python3 -c "
+import sys, re
+data = sys.stdin.buffer.read()
+data = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b' ', data)   # CSI sequences
+data = re.sub(rb'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)', b' ', data)  # OSC sequences
+data = re.sub(rb'\x1b.', b' ', data)                     # other escapes
+data = data.replace(b'\r', b'\n')                         # CR -> newline
+data = re.sub(rb'[\x00-\x08\x0b-\x1f\x7f]', b' ', data) # strip control chars
+text = data.decode('utf-8', errors='replace')
+lines = [' '.join(l.split()) for l in text.split('\n') if l.strip()]
+print('\n'.join(lines[-500:]))
+")
+
+        # Debug log: save rate-limit-related lines for post-mortem
+        {
+            echo "=== $(date) === (exit code: $_script_exit) ==="
+            echo "$tail_output" | grep -i "limit\|resets\|hit\|usage" || echo "(no match)"
+        } >> "$RATE_LIMIT_DEBUG" 2>/dev/null
+
+        # Detect rate limit: matches specific Claude rate-limit messages only.
+        # Avoid broad patterns like "rate.limit" or "usage limit" which match normal conversation text.
+        if echo "$tail_output" | grep -qi "hit your.*limit\|fast limit reached\|out of extra usage\|You've hit your limit"; then
+            local reset_line
+            reset_line=$(echo "$tail_output" | grep -i "resets" | tail -1)
+
+            local sleep_secs
+            sleep_secs=$(python3 << PYEOF
+import re, sys
+from datetime import datetime, timedelta
+import zoneinfo
+
+line = '''$reset_line'''
+
+# "resets in Xh Ym" format (fast mode / cooldown)
+m = re.search(r'resets in\s+(?:(\d+)h\s*)?(?:(\d+)m)?', line, re.IGNORECASE)
+if m and (m.group(1) or m.group(2)):
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    print(max(h * 3600 + mins * 60 + 60, 60))
+    sys.exit()
+
+# "resets 11pm (America/New_York)" format (regular limit)
+match = re.search(r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)', line, re.IGNORECASE)
+if not match:
+    print(300)
+    sys.exit()
+
+time_str = match.group(1).strip().upper().replace(' ', '')
+tz_str = match.group(2).strip()
+
+try:
+    tz = zoneinfo.ZoneInfo(tz_str)
+except Exception:
+    tz = zoneinfo.ZoneInfo('UTC')
+
+now = datetime.now(tz)
+parsed = None
+for fmt in ['%I:%M%p', '%I%p']:
+    try:
+        parsed = datetime.strptime(time_str, fmt)
+        break
+    except ValueError:
+        continue
+
+if not parsed:
+    print(300)
+    sys.exit()
+
+reset = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+if reset <= now:
+    reset += timedelta(days=1)
+
+diff = int((reset - now).total_seconds()) + 60
+print(max(diff, 60))
+PYEOF
+)
+            local mins=$((sleep_secs / 60))
+            local reset_desc
+            if echo "$reset_line" | grep -qi "resets in"; then
+                reset_desc=$(echo "$reset_line" | grep -oiP 'resets in [\dhm ]+' | head -1)
+            else
+                reset_desc=$(echo "$reset_line" | grep -oP 'resets\s+\K[^(]+' | sed 's/ *$//')
+            fi
+
+            echo ""
+            echo "══════════════════════════════════════════════════════"
+            echo "  Rate limit hit. Auto-resuming in ~${mins} minutes"
+            echo "  (${reset_desc:-unknown reset time})"
+            echo "  Press Ctrl-C to cancel"
+            echo "══════════════════════════════════════════════════════"
+            echo ""
+
+            sleep "$sleep_secs"
+
+            echo "Resuming session..."
+            claude_args=("${BASE_CLAUDE_ARGS[@]}" --continue)
+        else
+            break
+        fi
+    done
+}
+
+# Schedule a rate-limit continue: prompt for reset time, count down, then relaunch.
+# Ctrl-K in the main picker triggers this. Ctrl-C during countdown cancels but saves state.
+do_continue() {
+    local project_path="$1"
+    local project_name
+    project_name=$(basename "$project_path")
+
+    # Load any stored reset time for this project
+    local hint=""
+    if [ -f "$CONTINUE_STATE_FILE" ]; then
+        hint=$(python3 - "$project_path" "$CONTINUE_STATE_FILE" << 'PYEOF'
+import json, sys
+proj, sf = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(sf))
+    print(d.get(proj, {}).get('reset_desc', ''))
+except Exception:
+    pass
+PYEOF
+) || true
+    fi
+
+    echo ""
+    echo "  Schedule continue: $project_name"
+    if [ -n "$hint" ]; then
+        echo -n "  Reset time [$hint, or enter new time]: "
+    else
+        echo -n "  Reset time (e.g. '1am', '1:30am', '01:30'): "
+    fi
+    read -r reset_input
+    echo ""
+
+    [ -z "$reset_input" ] && reset_input="$hint"
+
+    if [ -z "$reset_input" ]; then
+        echo "  Cancelled."
+        sleep 1
+        return 0
+    fi
+
+    # Parse reset time → seconds from now
+    local sleep_secs
+    sleep_secs=$(python3 - "$reset_input" << 'PYEOF'
+import re, sys
+from datetime import datetime, timedelta
+
+line = sys.argv[1].strip()
+
+# Relative: "30m", "1h", "1h30m", "in 30m"
+m = re.search(r'(?:in\s+)?(?:(\d+)h)?\s*(?:(\d+)m)?$', line, re.IGNORECASE)
+if m and (m.group(1) or m.group(2)):
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    if h or mins:
+        print(max(h * 3600 + mins * 60 + 60, 60))
+        sys.exit()
+
+# 12-hour format: "1am", "1:30am", "1:30 am"
+match = re.search(r'(\d{1,2}(?::\d{2})?\s*[ap]m)', line, re.IGNORECASE)
+if match:
+    ts = match.group(1).strip().upper().replace(' ', '')
+    now = datetime.now()
+    for fmt in ['%I:%M%p', '%I%p']:
+        try:
+            p = datetime.strptime(ts, fmt)
+            reset = now.replace(hour=p.hour, minute=p.minute, second=0, microsecond=0)
+            if reset <= now:
+                reset += timedelta(days=1)
+            print(max(int((reset - now).total_seconds()) + 60, 60))
+            sys.exit()
+        except ValueError:
+            pass
+
+# 24-hour format: "01:30", "13:30"
+m24 = re.match(r'^(\d{1,2}):(\d{2})$', line)
+if m24:
+    now = datetime.now()
+    reset = now.replace(hour=int(m24.group(1)), minute=int(m24.group(2)), second=0, microsecond=0)
+    if reset <= now:
+        reset += timedelta(days=1)
+    print(max(int((reset - now).total_seconds()) + 60, 60))
+    sys.exit()
+
+print(300)
+PYEOF
+) || true
+
+    if [ -z "$sleep_secs" ] || ! [[ "$sleep_secs" =~ ^[0-9]+$ ]]; then
+        echo "  Could not parse '$reset_input'. Try '1am' or '01:30'." >&2
+        sleep 2
+        return 0
+    fi
+
+    local reset_epoch=$(( $(date +%s) + sleep_secs ))
+    local mins=$(( sleep_secs / 60 ))
+
+    # Save state so the picker shows this as [~] waiting
+    python3 - "$project_path" "$CONTINUE_STATE_FILE" "$reset_epoch" "$reset_input" << 'PYEOF' 2>/dev/null || true
+import json, os, sys
+proj, sf, epoch, desc = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+os.makedirs(os.path.dirname(sf), exist_ok=True)
+try:
+    d = json.load(open(sf)) if os.path.exists(sf) else {}
+except Exception:
+    d = {}
+d[proj] = {'reset_epoch': epoch, 'reset_desc': desc}
+json.dump(d, open(sf, 'w'), indent=2)
+PYEOF
+
+    # Blocking countdown — Ctrl-C cancels (but state is saved)
+    echo "  ============================================================"
+    echo "  Resuming '$project_name' in ~${mins} min  (reset: ${reset_input})"
+    echo "  Press Ctrl-C to cancel the countdown"
+    echo "  ============================================================"
+    echo ""
+
+    local cancelled=0
+    local spin_idx=0
+    local -a spinners=('-' '\' '|' '/')
+
+    trap 'cancelled=1' INT
+    while [ "$(date +%s)" -lt "$reset_epoch" ] && [ "$cancelled" -eq 0 ]; do
+        local remaining=$(( reset_epoch - $(date +%s) ))
+        local h=$(( remaining / 3600 ))
+        local m=$(( (remaining % 3600) / 60 ))
+        local s=$(( remaining % 60 ))
+        local spin="${spinners[$((spin_idx % 4))]}"
+        spin_idx=$(( spin_idx + 1 ))
+        printf "\r  [%s] %02d:%02d:%02d remaining  " "$spin" "$h" "$m" "$s"
+        sleep 1 || true
+    done
+    trap - INT
+    echo ""
+
+    if [ "$cancelled" -eq 1 ]; then
+        echo ""
+        echo "  Countdown cancelled. State saved - Ctrl-K again to restart."
+        sleep 2
+        return 0
+    fi
+
+    # Remove from state file
+    python3 - "$project_path" "$CONTINUE_STATE_FILE" << 'PYEOF' 2>/dev/null || true
+import json, os, sys
+proj, sf = sys.argv[1], sys.argv[2]
+if os.path.exists(sf):
+    try:
+        d = json.load(open(sf))
+        d.pop(proj, None)
+        json.dump(d, open(sf, 'w'), indent=2)
+    except Exception:
+        pass
+PYEOF
+
+    echo ""
+    echo "  Resuming $project_name..."
+    sleep 1
+    cd "$project_path"
+    launch_claude --continue || true
+}
+
+# Encode a filesystem path to the Claude session directory name format.
+# Claude replaces every non-alphanumeric character with a hyphen.
+encode_path() {
+    echo "$1" | python3 -c "import sys, re; print(re.sub(r'[^a-zA-Z0-9]', '-', sys.stdin.read().strip()))"
+}
+
+# Find all session dirs in ~/.claude/projects that belong to a given project path.
+# Checks both the current bind-mount path and the old /mnt/raid0 path (pre-bind-mount).
+find_session_dirs() {
+    local path="$1"
+    local cp="$HOME/.claude/projects"
+
+    local enc
+    enc=$(encode_path "$path")
+    [ -d "$cp/$enc" ] && echo "$cp/$enc"
+
+    # Also check old NAS-path encoding (sessions created before bind-mounts were set up)
+    local nas_path="${path/$HOME\/projects//mnt/raid0/projects}"
+    if [ "$nas_path" != "$path" ]; then
+        local nas_enc
+        nas_enc=$(encode_path "$nas_path")
+        [ "$nas_enc" != "$enc" ] && [ -d "$cp/$nas_enc" ] && echo "$cp/$nas_enc"
+    fi
+}
+
+# Archive a project: move it and its session data to the NAS backup area.
+archive_project() {
+    local path="$1"
+    local name
+    name=$(basename "$path")
+    local archive_dir="/mnt/raid0/backups/projects"
+
+    echo ""
+    echo "  Archive: $name"
+    echo "  From:    $path"
+    echo "  To:      $archive_dir/$name"
+    echo ""
+    echo -n "  Confirm? [y/N] "
+    read -r confirm
+    echo ""
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 1; }
+
+    mkdir -p "$archive_dir" || { echo "  Cannot create $archive_dir (NAS accessible?)" >&2; return 1; }
+    mv "$path" "$archive_dir/$name" || { echo "  Failed to move project." >&2; return 1; }
+    echo "  Project moved."
+
+    local archive_sessions="/mnt/raid0/backups/claude-sessions"
+    mkdir -p "$archive_sessions"
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        mv "$sd" "$archive_sessions/$(basename "$sd")" 2>/dev/null \
+            && echo "  Session data archived: $(basename "$sd")" || true
+    done < <(find_session_dirs "$path")
+
+    echo "  Done."
+}
+
+# Delete a project: remove directory, session data, and optionally the GitHub repo.
+delete_project() {
+    local path="$1"
+    local name
+    name=$(basename "$path")
+
+    # Detect GitHub remote before we delete the directory
+    local github_repo=""
+    if [ -d "$path/.git" ]; then
+        github_repo=$(cd "$path" && git remote get-url origin 2>/dev/null \
+            | sed -nE 's|.*github\.com[/:]([^/]+/[^/]+?)(\.git)?$|\1|p' || true)
+    fi
+
+    echo ""
+    echo "  DELETE: $name"
+    [ -n "$github_repo" ] && echo "  GitHub: github.com/$github_repo"
+    echo ""
+    echo -n "  Type project name to confirm: "
+    read -r confirm
+    echo ""
+    [ "$confirm" = "$name" ] || { echo "  Name mismatch, cancelled."; return 1; }
+
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        rm -rf "$sd"
+        echo "  Session data deleted: $(basename "$sd")"
+    done < <(find_session_dirs "$path")
+
+    rm -rf "$path"
+    echo "  Project directory deleted."
+
+    if [ -n "$github_repo" ] && command -v gh &>/dev/null; then
+        echo -n "  Delete GitHub repo $github_repo? [y/N] "
+        read -r del_gh
+        echo ""
+        if [[ "$del_gh" =~ ^[Yy]$ ]]; then
+            gh repo delete "$github_repo" --yes \
+                && echo "  GitHub repo deleted." \
+                || echo "  Failed to delete GitHub repo (check: gh auth status)."
+        fi
+    fi
+
+    echo "  Done."
+}
+
+# Build the session list for a project.
+# Output format: "FILEPATH\tDISPLAY_LINE" sorted newest-first.
+build_session_list() {
+    local project_path="$1"
+
+    # Collect all JSONL files from every session dir that belongs to this project
+    local all_files=()
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        while IFS= read -r jf; do
+            [ -f "$jf" ] && all_files+=("$jf")
+        done < <(ls -1 "$sd"/*.jsonl 2>/dev/null || true)
+    done < <(find_session_dirs "$project_path")
+
+    [ ${#all_files[@]} -eq 0 ] && return 0
+
+    python3 - "${all_files[@]}" << 'PYEOF'
+import sys, json, os
+from datetime import datetime, timezone
+
+files = sys.argv[1:]
+
+def rel_date(ts):
+    dt  = datetime.fromtimestamp(ts, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    s   = int((now - dt).total_seconds())
+    if s < 3600:    return f"{s//60}m ago"
+    if s < 86400:   return f"{s//3600}h ago"
+    if s < 172800:  return "yesterday"
+    if s < 604800:  return f"{s//86400}d ago"
+    if s < 2592000: return f"{s//604800}w ago"
+    return dt.strftime('%Y-%m-%d')
+
+sessions = []
+for f in files:
+    try:
+        mtime = os.path.getmtime(f)
+        size  = os.path.getsize(f)
+        first_msg  = ''
+        user_count = 0
+        with open(f, errors='replace') as fh:
+            for i, line in enumerate(fh):
+                if i > 3000: break
+                try:
+                    d = json.loads(line)
+                    if d.get('message', {}).get('role') == 'user':
+                        user_count += 1
+                        if not first_msg:
+                            content = d['message'].get('content', '')
+                            if isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get('type') == 'text':
+                                        first_msg = c['text'].strip().replace('\n', ' ')
+                                        break
+                            elif isinstance(content, str):
+                                first_msg = content.strip().replace('\n', ' ')
+                except Exception:
+                    pass
+        sessions.append((mtime, f, first_msg[:75], user_count, size))
+    except Exception:
+        pass
+
+sessions.sort(reverse=True)
+
+for i, (mtime, f, first_msg, user_count, size) in enumerate(sessions):
+    date_str = rel_date(mtime)
+    sz       = f"{size//1024}KB" if size < 1048576 else f"{size//1048576}MB"
+    summary  = first_msg if first_msg else "(empty session)"
+    marker   = "\033[32m●\033[0m" if i == 0 else "\033[2m○\033[0m"
+    display  = (f"{marker}  \033[2m{date_str}\033[0m"
+                f"  \033[33m{user_count}q\033[0m  \033[2m{sz}\033[0m"
+                f"  {summary}")
+    print(f"{f}\t{display}")
+PYEOF
+}
+
+# Search session content for a phrase.
+# Usage: search_sessions [project_path]
+# Without project_path: searches across all known projects.
+# Results shown in fzf; Enter opens that session.
+search_sessions() {
+    local project_filter="${1:-}"
+    local scope_label
+    if [ -n "$project_filter" ]; then
+        scope_label="in $(basename "$project_filter")"
+    else
+        scope_label="across all projects"
+    fi
+
+    echo ""
+    echo -n "  Search $scope_label: "
+    read -r query
+    echo ""
+    [ -z "$query" ] && { echo "  Cancelled."; sleep 1; return 0; }
+
+    echo "  Searching…"
+
+    local results
+    results=$(python3 - "$query" "$project_filter" << 'PYEOF'
+import sys, json, os, glob, re
+from datetime import datetime, timezone
+
+query       = sys.argv[1]
+proj_filter = sys.argv[2] if len(sys.argv) > 2 else ''
+pattern     = re.compile(re.escape(query), re.IGNORECASE)
+cp          = os.path.expanduser('~/.claude/projects')
+
+def encode_path(p):
+    return re.sub(r'[^a-zA-Z0-9]', '-', p)
+
+def relative_date(ts):
+    now = datetime.now(timezone.utc)
+    dt  = datetime.fromtimestamp(ts, tz=timezone.utc)
+    s   = int((now - dt).total_seconds())
+    if s < 3600:   return f"{s//60}m ago"
+    if s < 86400:  return f"{s//3600}h ago"
+    if s < 172800: return "yesterday"
+    if s < 604800: return f"{s//86400}d ago"
+    return dt.strftime('%Y-%m-%d')
+
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(b.get('text', '') for b in content
+                         if isinstance(b, dict) and b.get('type') == 'text')
+    return ''
+
+def get_project_path(session_dir):
+    idx = os.path.join(session_dir, 'sessions-index.json')
+    if os.path.isfile(idx):
+        try:
+            d = json.load(open(idx))
+            p = d.get('originalPath')
+            if p: return p
+        except Exception: pass
+    for jf in sorted(glob.glob(os.path.join(session_dir, '*.jsonl')),
+                     key=os.path.getmtime, reverse=True):
+        try:
+            with open(jf) as f:
+                for i, line in enumerate(f):
+                    if i > 5: break
+                    try:
+                        d = json.loads(line)
+                        if d.get('cwd'): return d['cwd']
+                    except Exception: pass
+        except Exception: pass
+    return None
+
+# Collect (session_dir, project_path) pairs to search
+pairs = []
+if proj_filter:
+    home    = os.path.expanduser('~')
+    nas     = proj_filter.replace(f'{home}/projects', '/mnt/raid0/projects')
+    for p in [proj_filter] + ([nas] if nas != proj_filter else []):
+        sd = os.path.join(cp, encode_path(p))
+        if os.path.isdir(sd):
+            pairs.append((sd, proj_filter))
+else:
+    if os.path.isdir(cp):
+        for entry in os.scandir(cp):
+            if not entry.is_dir(): continue
+            proj_path = get_project_path(entry.path)
+            if proj_path:
+                pairs.append((entry.path, proj_path))
+
+results = []
+for session_dir, proj_path in pairs:
+    proj_name = os.path.basename(proj_path)
+    for jf in glob.glob(os.path.join(session_dir, '*.jsonl')):
+        hits_u, hits_a = 0, 0
+        best_snippet   = ''
+        try:
+            with open(jf, errors='replace') as f:
+                for line in f:
+                    try:
+                        d    = json.loads(line)
+                        msg  = d.get('message', {})
+                        role = msg.get('role', '')
+                        if role not in ('user', 'assistant'): continue
+                        text = extract_text(msg.get('content', ''))
+                        for m in pattern.finditer(text):
+                            if role == 'user': hits_u += 1
+                            else:              hits_a += 1
+                            if not best_snippet:
+                                s = max(0, m.start() - 50)
+                                e = min(len(text), m.end() + 90)
+                                best_snippet = text[s:e].replace('\n', ' ').strip()
+                    except Exception: pass
+        except Exception: pass
+
+        n = hits_u + hits_a
+        if not n: continue
+
+        mtime   = os.path.getmtime(jf)
+        date    = relative_date(mtime)
+        parts   = []
+        if hits_u: parts.append(f"{hits_u} by you")
+        if hits_a: parts.append(f"{hits_a} by Claude")
+        detail  = ', '.join(parts)
+        snippet = best_snippet[:90] + '…' if len(best_snippet) > 90 else best_snippet
+
+        display = (f"\033[1;36m{proj_name}\033[0m"
+                   f"  \033[2m{date}\033[0m"
+                   f"  \033[33m{n} hit{'s' if n>1 else ''}  \033[2m({detail})\033[0m"
+                   f"  \033[2m…{snippet}…\033[0m")
+        # Field 1: JSONL path (for preview)
+        # Field 2: project path (for resume action)
+        # Field 3: display
+        results.append((mtime, jf, proj_path, display))
+
+results.sort(reverse=True)
+for _, jf, proj_path, display in results:
+    print(f"{jf}\t{proj_path}\t{display}")
+PYEOF)
+
+    if [ -z "$results" ]; then
+        echo "  No matches found for: $query"
+        sleep 2
+        return 0
+    fi
+
+    local count
+    count=$(echo "$results" | wc -l)
+
+    local raw
+    raw=$(echo -e "$results" | fzf \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=3 \
+        --header="$(printf '  Search: \033[33m%s\033[0m  ·  %d result(s)  ·  Enter: open session  ·  Esc: back' "$query" "$count")" \
+        --header-first \
+        --no-sort \
+        --reverse \
+        --height=100% \
+        --border=rounded \
+        --prompt="  filter> " \
+        --pointer="▶" \
+        --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+        --preview='python3 ~/.local/bin/claude-session-preview {1}' \
+        --preview-window='right:50%:wrap:border-left' \
+    ) || return 0
+
+    local session_file selected_proj
+    session_file=$(echo "$raw" | cut -f1)
+    selected_proj=$(echo "$raw" | cut -f2)
+
+    [ -z "$session_file" ] || [ -z "$selected_proj" ] && return 0
+    [ -d "$selected_proj" ] || { echo "  Project not found: $selected_proj" >&2; sleep 2; return 0; }
+
+    resume_from_session "$selected_proj" "$session_file"
+}
+
+# Browse sessions for a project.
+# Enter: resume Claude from that session.
+# Ctrl-F: fork the project from that session point.
+# Esc: back to main picker.
+browse_sessions() {
+    local project_path="$1"
+    local project_name
+    project_name=$(basename "$project_path")
+
+    while true; do
+        local session_list
+        session_list=$(build_session_list "$project_path")
+
+        if [ -z "$session_list" ]; then
+            echo "  No sessions found for $project_name."
+            sleep 2
+            return 0
+        fi
+
+        local raw
+        raw=$(echo -e "$session_list" | fzf \
+            --ansi \
+            --delimiter='\t' \
+            --with-nth=2 \
+            --header="$(printf '  \033[1;36m%s\033[0m  ·  session history\n  Enter: resume  ·  Ctrl-F: fork  ·  Esc: back' "$project_name")" \
+            --header-first \
+            --no-sort \
+            --reverse \
+            --height=100% \
+            --border=rounded \
+            --prompt="  history> " \
+            --pointer="▶" \
+            --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+            --expect=ctrl-f \
+            --preview='python3 ~/.local/bin/claude-session-preview {1}' \
+            --preview-window='right:50%:wrap:border-left' \
+        ) || return 0  # Esc → back to main picker
+
+        local pressed_key selected_file
+        pressed_key=$(echo "$raw" | head -1)
+        selected_file=$(echo "$raw" | tail -n +2 | cut -f1)
+        [ -z "$selected_file" ] && return 0
+
+        if [ "$pressed_key" = "ctrl-f" ]; then
+            fork_from_session "$project_path" "$selected_file" || continue
+            return 0
+        else
+            resume_from_session "$project_path" "$selected_file"
+            return 0
+        fi
+    done
+}
+
+# Resume Claude from a specific session JSONL file.
+# Copies the file into the current-encoding session dir if needed,
+# then touches it so --continue picks it up as the most recent session.
+resume_from_session() {
+    local project_path="$1"
+    local session_file="$2"
+
+    local target_dir="$HOME/.claude/projects/$(encode_path "$project_path")"
+    mkdir -p "$target_dir"
+
+    # If the file lives in an old-encoded dir, copy it into the current one
+    local target_file="$target_dir/$(basename "$session_file")"
+    if [ "$session_file" != "$target_file" ]; then
+        cp "$session_file" "$target_file"
+    fi
+    touch "$target_file"
+
+    cd "$project_path"
+    launch_claude --continue || true
+}
+
+# Fork a project from a chosen session point.
+# Copies the project directory and seeds the new project with the chosen session.
+fork_from_session() {
+    local src_path="$1"
+    local session_file="$2"
+    local src_name
+    src_name=$(basename "$src_path")
+
+    echo ""
+    echo -n "  Fork name [${src_name}-fork]: "
+    read -r fork_name
+    fork_name="${fork_name:-${src_name}-fork}"
+    echo ""
+
+    local fork_path="$USER_PROJECTS_DIR/$fork_name"
+    if [ -d "$fork_path" ]; then
+        echo "  Already exists: $fork_path" >&2
+        sleep 2
+        return 1
+    fi
+
+    echo "  Copying project files…"
+    cp -r "$src_path" "$fork_path"
+
+    # Fresh git history from current state — keeps files, drops source commits
+    if [ -d "$fork_path/.git" ]; then
+        echo "  Reinitialising git history…"
+        rm -rf "$fork_path/.git"
+        git -C "$fork_path" init -q
+        git -C "$fork_path" add -A 2>/dev/null || true
+        git -C "$fork_path" \
+            -c user.name="${GIT_AUTHOR_NAME:-$(git config user.name 2>/dev/null || echo Fork)}" \
+            -c user.email="${GIT_AUTHOR_EMAIL:-$(git config user.email 2>/dev/null || echo fork@local)}" \
+            commit -q --allow-empty -m "Fork of $src_name" 2>/dev/null || true
+        git -C "$fork_path" remote remove origin 2>/dev/null || true
+    fi
+
+    # Seed Claude session: copy the chosen JSONL into the new project's session dir
+    local new_session_dir="$HOME/.claude/projects/$(encode_path "$fork_path")"
+    mkdir -p "$new_session_dir"
+    local new_session_file="$new_session_dir/$(basename "$session_file")"
+    cp "$session_file" "$new_session_file"
+    touch "$new_session_file"
+
+    # Note the fork provenance in CLAUDE.md
+    local fork_claude_md="$fork_path/CLAUDE.md"
+    if [ -f "$fork_claude_md" ]; then
+        printf '\n---\n_Forked from **%s** on %s_\n' \
+            "$src_name" "$(date '+%Y-%m-%d')" >> "$fork_claude_md"
+    fi
+
+    echo "  Fork ready: $fork_path"
+    echo "  Opening Claude…"
+    sleep 1
+    cd "$fork_path"
+    launch_claude --continue || true
+}
+
+# Internal: rename a project directory and migrate session data.
+# Usage: _do_rename OLD_PATH NEW_NAME  (no interactive prompts)
+_do_rename() {
+    local old_path="$1"
+    local new_name="$2"
+    local parent_dir
+    parent_dir=$(dirname "$old_path")
+    local new_path="$parent_dir/$new_name"
+    local old_name
+    old_name=$(basename "$old_path")
+
+    if [ -d "$new_path" ]; then
+        echo "  Already exists: $new_path" >&2
+        return 1
+    fi
+
+    # Explicit check: set -e is suppressed when this function is called via ||
+    local mv_err
+    if ! mv_err=$(mv "$old_path" "$new_path" 2>&1); then
+        echo "  Rename failed: $mv_err" >&2
+        return 1
+    fi
+    echo "  Renamed: $old_name → $new_name"
+
+    # Migrate session JSONL files to the new encoded dir.
+    # find_session_dirs uses encode_path (looks in ~/.claude/projects/), so it
+    # still works after the project dir has been moved.
+    local new_session_dir="$HOME/.claude/projects/$(encode_path "$new_path")"
+    mkdir -p "$new_session_dir"
+    local moved=0
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        for jf in "$sd"/*.jsonl; do
+            [ -f "$jf" ] || continue
+            local dest="$new_session_dir/$(basename "$jf")"
+            # Avoid collision: prefix with old session-dir name
+            [ -f "$dest" ] && dest="$new_session_dir/$(basename "$sd")-$(basename "$jf")"
+            mv "$jf" "$dest" && moved=$((moved + 1))
+        done
+        rmdir "$sd" 2>/dev/null || true
+    done < <(find_session_dirs "$old_path")
+
+    [ $moved -gt 0 ] && echo "  Migrated $moved session file(s)."
+    return 0
+}
+
+# Rename a project interactively (prompts for new name, then calls _do_rename).
+rename_project() {
+    local path="$1"
+    local old_name
+    old_name=$(basename "$path")
+
+    echo ""
+    echo "  Rename project: $old_name"
+    echo -n "  New name [$old_name]: "
+    read -r new_name
+    echo ""
+    new_name="${new_name:-$old_name}"
+
+    [ "$new_name" = "$old_name" ] && { echo "  Unchanged."; sleep 1; return 0; }
+
+    if [[ "$new_name" =~ [/\\] ]]; then
+        echo "  Invalid name (no slashes allowed)." >&2
+        sleep 2
+        return 1
+    fi
+
+    _do_rename "$path" "$new_name" || { sleep 2; return 1; }
+    echo "  Done."
+    sleep 1
+}
+
+# Merge a source project into a chosen target project.
+# A second fzf picker selects the target; the user then picks the final name.
+merge_projects() {
+    local src_path="$1"
+    local src_name
+    src_name=$(basename "$src_path")
+
+    # Build project list excluding the source
+    local src_tab_pattern=":${src_path}"$'\t'
+    local project_list
+    project_list=$(build_project_list | grep -Fv "$src_tab_pattern")
+
+    if [ -z "$project_list" ]; then
+        echo "  No other projects available to merge into." >&2
+        sleep 2
+        return 1
+    fi
+
+    # Second fzf picker: pick target
+    local raw_target
+    raw_target=$(echo -e "$project_list" | fzf \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=2 \
+        --header="$(printf '  Merge \033[1;36m%s\033[0m  →  which project?   ·   Esc: cancel' "$src_name")" \
+        --header-first \
+        --no-sort \
+        --reverse \
+        --height=100% \
+        --border=rounded \
+        --prompt="  merge into> " \
+        --pointer="▶" \
+        --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+    ) || { echo "  Cancelled."; sleep 1; return 0; }
+
+    local target_field
+    target_field=$(echo "$raw_target" | cut -f1)
+    local target_path="${target_field#*:}"
+    local target_name
+    target_name=$(basename "$target_path")
+
+    if [ -z "$target_path" ] || [ ! -d "$target_path" ]; then
+        echo "  Invalid target." >&2
+        sleep 2
+        return 1
+    fi
+
+    # Safety: refuse to merge if either path is $HOME itself
+    if [ "$target_path" = "$HOME" ] || [ "$src_path" = "$HOME" ]; then
+        echo "  Cannot merge the home directory — aborting." >&2
+        sleep 2
+        return 1
+    fi
+
+    # Choose the final project name
+    echo ""
+    echo "  ┌─ Merge: $src_name  →  $target_name"
+    echo "  │"
+    echo "  │  Final name for merged project:"
+    echo "  │    1) Keep target name:  $target_name"
+    echo "  │    2) Use source name:   $src_name"
+    echo "  │    3) Enter a new name"
+    echo "  │"
+    echo -n "  └─ Choice [1/2/3, default 1]: "
+    read -r name_choice
+    echo ""
+
+    local final_name
+    case "$name_choice" in
+        2) final_name="$src_name" ;;
+        3)
+            echo -n "  New name: "
+            read -r final_name
+            echo ""
+            if [ -z "$final_name" ]; then
+                echo "  Cancelled."; sleep 1; return 0
+            fi
+            if [[ "$final_name" =~ [/\\] ]]; then
+                echo "  Invalid name (no slashes)." >&2; sleep 2; return 1
+            fi
+            ;;
+        *) final_name="$target_name" ;;
+    esac
+
+    echo "  Will merge '$src_name' into '$final_name'."
+    echo -n "  Confirm? [y/N] "
+    read -r confirm
+    echo ""
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Cancelled."; sleep 1; return 0; }
+
+    # Step 1: Rename target if the final name differs
+    if [ "$final_name" != "$target_name" ]; then
+        local renamed_path
+        renamed_path="$(dirname "$target_path")/$final_name"
+        if [ -d "$renamed_path" ]; then
+            echo "  Name already taken: $renamed_path" >&2; sleep 2; return 1
+        fi
+        echo "  Renaming target: $target_name → $final_name…"
+        _do_rename "$target_path" "$final_name" || { sleep 2; return 1; }
+        target_path="$renamed_path"
+    fi
+
+    # Step 2: Concatenate CLAUDE.md (append source section to target)
+    if [ -f "$src_path/CLAUDE.md" ]; then
+        {
+            printf '\n---\n## Merged from: %s  (%s)\n\n' "$src_name" "$(date '+%Y-%m-%d')"
+            cat "$src_path/CLAUDE.md"
+        } >> "$target_path/CLAUDE.md"
+        echo "  CLAUDE.md merged."
+    fi
+
+    # Step 3: Copy source files into target (no-clobber; skip .git and CLAUDE.md)
+    if command -v rsync &>/dev/null; then
+        rsync -a --ignore-existing --exclude='.git' --exclude='CLAUDE.md' \
+            "$src_path/" "$target_path/" 2>/dev/null || true
+    else
+        find "$src_path" -mindepth 1 \
+            \( -name '.git' -o -name 'CLAUDE.md' \) -prune \
+            -o -type f -print | while IFS= read -r f; do
+            local rel="${f#"$src_path"/}"
+            local dest="$target_path/$rel"
+            if [ ! -f "$dest" ]; then
+                mkdir -p "$(dirname "$dest")"
+                cp "$f" "$dest"
+            fi
+        done
+    fi
+    echo "  Project files merged (target files take precedence)."
+
+    # Step 4: Move source session JSONLs into the target's session dir
+    local target_session_dir="$HOME/.claude/projects/$(encode_path "$target_path")"
+    mkdir -p "$target_session_dir"
+    local moved=0
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        for jf in "$sd"/*.jsonl; do
+            [ -f "$jf" ] || continue
+            local dest="$target_session_dir/$(basename "$jf")"
+            # Collision avoidance: prefix with nanoseconds
+            [ -f "$dest" ] && dest="$target_session_dir/$(date +%s%N | tail -c 8)-$(basename "$jf")"
+            mv "$jf" "$dest" && moved=$((moved + 1))
+        done
+        rmdir "$sd" 2>/dev/null || true
+    done < <(find_session_dirs "$src_path")
+    [ $moved -gt 0 ] && echo "  Moved $moved session file(s) to merged project."
+
+    # Step 5: Delete source project directory
+    rm -rf "$src_path"
+    echo "  Source '$src_name' deleted."
+    echo ""
+    echo "  ✓ Merge complete  →  $final_name"
+    sleep 2
+}
+
+# Build the project list using python3
+build_project_list() {
+    python3 << 'PYEOF'
+import json
+import os
+import glob
+import time
+from datetime import datetime, timezone
+claude_projects_dir = os.path.expanduser("~/.claude/projects")
+user_projects_dir = os.path.expanduser("~/projects")
+
+def get_live_cwds():
+    """Return set of project paths with an active claude process."""
+    live = set()
+    try:
+        for entry in os.scandir('/proc'):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f'/proc/{entry.name}/cmdline', 'rb') as f:
+                    if b'claude' not in f.read():
+                        continue
+                cwd = os.readlink(f'/proc/{entry.name}/cwd')
+                live.add(os.path.normpath(cwd))
+            except (OSError, PermissionError, FileNotFoundError):
+                pass
+    except (OSError, PermissionError):
+        pass
+    return live
+
+def get_waiting_projects():
+    """Return dict of project_path -> reset_desc for active countdowns."""
+    waiting = {}
+    sf = os.path.expanduser('~/.claude/continue-state.json')
+    if os.path.isfile(sf):
+        try:
+            data = json.load(open(sf))
+            now = time.time()
+            for path, info in data.items():
+                if info.get('reset_epoch', 0) > now:
+                    waiting[os.path.normpath(path)] = info.get('reset_desc', '?')
+        except Exception:
+            pass
+    return waiting
+
+live_cwds = get_live_cwds()
+waiting_projects = get_waiting_projects()
+
+def relative_date(iso_str):
+    if not iso_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        secs = int((now - dt).total_seconds())
+        if secs < 60:      return "just now"
+        if secs < 3600:    return f"{secs//60}m ago"
+        if secs < 86400:   return f"{secs//3600}h ago"
+        if secs < 172800:  return "yesterday"
+        if secs < 604800:  return f"{secs//86400}d ago"
+        if secs < 2592000: return f"{secs//604800}w ago"
+        return iso_str[:10]
+    except Exception:
+        return iso_str[:10] if iso_str else "?"
+
+projects = {}  # path -> {sessions, last_modified, summary}
+
+# Scan ~/.claude/projects/ for session data
+if os.path.isdir(claude_projects_dir):
+    for entry in os.scandir(claude_projects_dir):
+        if not entry.is_dir():
+            continue
+
+        real_path = None
+        sessions = 0
+        last_modified = None
+        summary = ""
+
+        index_file = os.path.join(entry.path, "sessions-index.json")
+        if os.path.isfile(index_file):
+            try:
+                with open(index_file) as f:
+                    data = json.load(f)
+                real_path = data.get("originalPath")
+                entries = data.get("entries", [])
+                sessions = len(entries)
+                # Find most recent entry
+                latest = None
+                for e in entries:
+                    mod = e.get("modified")
+                    if mod and (latest is None or mod > latest.get("modified", "")):
+                        latest = e
+                if latest:
+                    last_modified = latest.get("modified", "")
+                    s = latest.get("summary", "")
+                    if s and s != "User Exited Claude Code CLI Session":
+                        summary = s
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Also count jsonl files (may have more than what's in the index)
+        jsonl_files = glob.glob(os.path.join(entry.path, "*.jsonl"))
+        if not sessions:
+            sessions = len(jsonl_files)
+
+        # If no real_path from index, try to get it from jsonl cwd field
+        if not real_path and jsonl_files:
+            # Try each jsonl (newest first) until we find a cwd
+            for jsonl_file in sorted(jsonl_files, key=os.path.getmtime, reverse=True):
+                try:
+                    with open(jsonl_file) as f:
+                        for i, line in enumerate(f):
+                            if i > 5:
+                                break
+                            try:
+                                d = json.loads(line)
+                                if d.get("cwd"):
+                                    real_path = d["cwd"]
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+                except OSError:
+                    continue
+                if real_path:
+                    break
+
+        # If still no real_path, skip this entry
+        if not real_path:
+            continue
+
+        # Never show $HOME itself as a project — it's not a real project directory
+        home = os.path.expanduser("~")
+        if os.path.normpath(real_path) == os.path.normpath(home):
+            continue
+
+        # Get last_modified from jsonl file mtime, always comparing against index value.
+        # sessions-index.json can be stale (not updated by Claude on every session),
+        # so we take whichever is newer: the index date or the actual file mtime.
+        if jsonl_files:
+            newest_mtime = max(os.path.getmtime(f) for f in jsonl_files)
+            file_modified = datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat()
+            if not last_modified or file_modified > last_modified:
+                last_modified = file_modified
+
+        # If no summary from index, try to get firstPrompt or summary from jsonl
+        if not summary and jsonl_files:
+            newest_jsonl = max(jsonl_files, key=os.path.getmtime)
+            try:
+                with open(newest_jsonl) as f:
+                    for i, line in enumerate(f):
+                        if i > 30:
+                            break
+                        try:
+                            d = json.loads(line)
+                            if d.get("type") == "summary" and d.get("summary"):
+                                summary = d["summary"]
+                                break
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                pass
+
+        if sessions > 0:
+            projects[real_path] = {
+                "sessions": sessions,
+                "last_modified": last_modified or "",
+                "summary": summary,
+            }
+
+# Scan ~/projects/ for directories that don't have sessions yet
+if os.path.isdir(user_projects_dir):
+    for entry in os.scandir(user_projects_dir):
+        if entry.is_dir() and entry.path not in projects:
+            projects[entry.path] = {
+                "sessions": 0,
+                "last_modified": "",
+                "summary": "",
+            }
+
+# Sort: projects with sessions first (by last_modified desc), then sessionless alphabetically
+with_sessions = []
+without_sessions = []
+
+for path, info in projects.items():
+    if info["sessions"] > 0:
+        with_sessions.append((path, info))
+    else:
+        without_sessions.append((path, info))
+
+with_sessions.sort(key=lambda x: x[1]["last_modified"], reverse=True)
+without_sessions.sort(key=lambda x: os.path.basename(x[0]).lower())
+
+# Output format: HAS_SESSIONS:PATH\tDISPLAY_LINE
+# HAS_SESSIONS is 1 or 0, used to decide --continue flag
+# PATH is hidden from fzf (--with-nth=2 shows only after the tab)
+
+for path, info in with_sessions:
+    name = os.path.basename(path)
+    date_str = relative_date(info["last_modified"])
+    summary_text = info["summary"][:58].replace("\n", " ") if info["summary"] else ""
+    sess = info["sessions"]
+    sess_word = "session" if sess == 1 else "sessions"
+
+    norm = os.path.normpath(path)
+    if norm in live_cwds:
+        status_flag = "L"
+        marker = "\033[1;32m[>]\033[0m"   # bright green: live
+        extra  = "  \033[1;32m(LIVE)\033[0m"
+    elif norm in waiting_projects:
+        status_flag = "W"
+        marker = "\033[33m[~]\033[0m"     # yellow: waiting for continue
+        extra  = f"  \033[33m(waiting: {waiting_projects[norm]})\033[0m"
+    else:
+        status_flag = "1"
+        marker = "\033[32m[*]\033[0m"     # green: normal
+        extra  = ""
+
+    line = (f"{marker} \033[1;36m{name}\033[0m"
+            f"  \033[2m·\033[0m \033[33m{sess} {sess_word}\033[0m"
+            f" \033[2m· {date_str}\033[0m{extra}")
+    if summary_text and status_flag not in ("L", "W"):
+        line += f"  \033[2m{summary_text}\033[0m"
+    print(f"{status_flag}:{path}\t{line}")
+
+for path, info in without_sessions:
+    name = os.path.basename(path)
+    line = f"\033[2m[-] {name}\033[0m"
+    print(f"0:{path}\t{line}")
+PYEOF
+}
+
+# Main
+main() {
+    # Run inside a named tmux session so it can be attached from anywhere.
+    # Skip if already inside tmux (TMUX is set) or if we were launched by tmux
+    # (CLAUDE_IN_TMUX is set, preventing infinite re-launch).
+    if [ -z "${TMUX:-}" ] && [ -z "${CLAUDE_IN_TMUX:-}" ]; then
+        if tmux has-session -t "chloe" 2>/dev/null; then
+            exec tmux attach-session -t "chloe"
+        else
+            exec tmux new-session -s "chloe" -e "CLAUDE_IN_TMUX=1" "chloe"
+        fi
+    fi
+
+    if ! command -v fzf &>/dev/null; then
+        echo "Error: fzf is required. Install with: sudo pacman -S fzf" >&2
+        exit 1
+    fi
+
+    # Loop: show picker, launch project, return here on /exit.
+    # Esc/Ctrl-C in fzf breaks the loop and exits the tmux session.
+    clear
+    while true; do
+        local project_list
+        project_list=$(build_project_list)
+
+        if [ -z "$project_list" ]; then
+            echo "No projects found." >&2
+            exit 1
+        fi
+
+        local new_project_line=$'\t\033[1;32m✦  NEW PROJECT \033[2m(with git)\033[0m'
+        local nogit_project_line=$'NOGIT:\t\033[0;32m◇  NEW PROJECT \033[2m(no git, no github)\033[0m'
+        local no_project_line=$'NOPROJ:\t\033[33m◈  NO PROJECT \033[2m(no git)\033[0m'
+        local full_list="${new_project_line}"$'\n'"${nogit_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
+
+        # Run fzf — --expect captures Ctrl-A/X without opening the project.
+        # Output: line 1 = key pressed ("" for Enter), line 2 = selected item.
+        local raw_selection
+        raw_selection=$(echo -e "$full_list" | fzf \
+            --ansi \
+            --delimiter='\t' \
+            --with-nth=2 \
+            --header=$'Enter: open  Ctrl-Y: history  Ctrl-F: find  Ctrl-S: search all  Ctrl-R: rename  Ctrl-G: merge  Ctrl-K: continue\n  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
+            --header-first \
+            --no-sort \
+            --reverse \
+            --height=100% \
+            --border=rounded \
+            --prompt="  " \
+            --pointer="▶" \
+            --marker="✓" \
+            --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+            --expect=ctrl-a,ctrl-x,ctrl-y,ctrl-r,ctrl-g,ctrl-k,ctrl-f,ctrl-s \
+            --preview='~/.local/bin/claude-project-preview {1}' \
+            --preview-window='right:45%:wrap:border-left:hidden' \
+            --bind='ctrl-/:toggle-preview' \
+        ) || break  # Esc/Ctrl-C exits the loop cleanly
+
+        local pressed_key
+        pressed_key=$(echo "$raw_selection" | head -1)
+        local selection
+        selection=$(echo "$raw_selection" | tail -n +2)
+
+        # Extract the path — format is "HAS_SESSIONS:PATH\tDISPLAY"
+        local selected_field
+        selected_field=$(echo "$selection" | cut -f1)
+        local selected_path="${selected_field#*:}"
+        local has_sessions_flag="${selected_field%%:*}"
+
+        # Handle archive / delete — continue to refresh the picker
+        if [ "$pressed_key" = "ctrl-a" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to archive." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                archive_project "$selected_path" || true
+                sleep 1
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-x" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to delete." >&2; sleep 1
+            else
+                delete_project "$selected_path" || true
+                sleep 1
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-y" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ] \
+                || [ "$has_sessions_flag" = "0" ]; then
+                echo "  Select a project with sessions to browse history." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                browse_sessions "$selected_path" || true
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-r" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to rename." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                rename_project "$selected_path" || true
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-g" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to merge." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                merge_projects "$selected_path" || true
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-k" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a project to schedule a continue." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                do_continue "$selected_path" || true
+            fi
+            clear
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-f" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ] \
+                || [ "$has_sessions_flag" = "0" ]; then
+                echo "  Select a project with sessions to search within it." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                search_sessions "$selected_path" || true
+            fi
+            clear
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-s" ]; then
+            search_sessions || true
+            clear
+            continue
+        fi
+
+        # Handle "~ NO PROJECT"
+        if [ "$has_sessions_flag" = "NOPROJ" ]; then
+            echo "Starting Claude without a project..."
+            launch_claude || true
+            continue
+        fi
+
+        # Handle "◇ NEW PROJECT (no git)"
+        if [ "$has_sessions_flag" = "NOGIT" ]; then
+            echo -n "New project name (no git): "
+            read -r project_name
+            if [ -z "$project_name" ]; then
+                continue
+            fi
+
+            local new_dir="$USER_PROJECTS_DIR/$project_name"
+            if [ -d "$new_dir" ]; then
+                echo "Directory already exists: $new_dir" >&2
+                echo "Launching Claude in existing directory..."
+                cd "$new_dir"
+                launch_claude || true
+                continue
+            fi
+
+            mkdir -p "$new_dir"
+            cd "$new_dir"
+            touch CLAUDE.md
+            echo "Created project (no git): $new_dir"
+            launch_claude || true
+            continue
+        fi
+
+        # Handle "✦ NEW PROJECT (with git)" (empty path)
+        if [ -z "$selected_path" ]; then
+            echo -n "New project name: "
+            read -r project_name
+            if [ -z "$project_name" ]; then
+                continue
+            fi
+
+            local new_dir="$USER_PROJECTS_DIR/$project_name"
+            if [ -d "$new_dir" ]; then
+                echo "Directory already exists: $new_dir" >&2
+                echo "Launching Claude in existing directory..."
+                cd "$new_dir"
+                launch_claude || true
+                continue
+            fi
+
+            mkdir -p "$new_dir"
+            cd "$new_dir"
+            git init
+            touch CLAUDE.md
+            echo "Created project: $new_dir"
+            launch_claude || true
+            continue
+        fi
+
+        # Handle existing project
+        if [ ! -d "$selected_path" ]; then
+            echo "Directory no longer exists: $selected_path" >&2
+            sleep 1
+            continue
+        fi
+
+        cd "$selected_path"
+
+        # Selecting a [~] waiting project resumes the countdown directly
+        if [ "$has_sessions_flag" = "W" ]; then
+            do_continue "$selected_path" || true
+            clear
+            continue
+        fi
+
+        if [[ "$has_sessions_flag" =~ ^(1|L)$ ]]; then
+            echo "Resuming in: $selected_path"
+            launch_claude --continue || true
+        else
+            echo "Starting new session in: $selected_path"
+            launch_claude || true
+        fi
+        clear
+        # Loop continues — picker shown again after claude exits
+    done
+}
+
+main "$@"
