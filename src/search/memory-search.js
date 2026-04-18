@@ -19,6 +19,15 @@ const HOME = os.homedir();
 const DEFAULT_DB_PATH = path.join(HOME, '.claude', 'lancedb');
 const TABLE_NAME = 'messages';
 
+let _embedderPromise = null;
+function getEmbedder() {
+  if (!_embedderPromise) {
+    const { pipeline } = require('@xenova/transformers');
+    _embedderPromise = pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+  }
+  return _embedderPromise;
+}
+
 /**
  * Search the LanceDB messages table semantically.
  * @param {string} query
@@ -31,9 +40,8 @@ async function searchMessages(query, opts = {}) {
   const projectFilter = opts.project || null;
 
   const lancedb = require('@lancedb/lancedb');
-  const { pipeline } = require('@xenova/transformers');
 
-  const embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+  const embedder = await getEmbedder();
   const out = await embedder(query, { pooling: 'mean', normalize: true });
   const queryVec = Array.from(out.data);
 

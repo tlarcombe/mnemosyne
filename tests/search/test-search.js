@@ -27,22 +27,26 @@ async function run() {
   }
   await db.createTable('messages', rows);
 
-  // Query 1: should surface the memory/dream row
-  const results1 = await searchMessages('memory consolidation dream', { dbPath: tmpDb, limit: 1 });
-  assert.strictEqual(results1.length, 1, 'Should return 1 result');
-  assert.strictEqual(results1[0].project, 'Mnemosyne', `Expected Mnemosyne, got ${results1[0].project}`);
+  try {
+    // Query 1: should surface the memory/dream row
+    const results1 = await searchMessages('memory consolidation dream', { dbPath: tmpDb, limit: 1 });
+    assert.strictEqual(results1.length, 1, 'Should return 1 result');
+    assert.strictEqual(results1[0].project, 'Mnemosyne', `Expected Mnemosyne, got ${results1[0].project}`);
 
-  // Query 2: should surface the fzf/picker row
-  const results2 = await searchMessages('fzf project picker', { dbPath: tmpDb, limit: 1 });
-  assert.strictEqual(results2[0].project, 'chloe', `Expected chloe, got ${results2[0].project}`);
+    // Query 2: should surface the fzf/picker row
+    const results2 = await searchMessages('fzf project picker', { dbPath: tmpDb, limit: 1 });
+    assert.ok(results2.length >= 1, 'Should return at least 1 result');
+    assert.strictEqual(results2[0].project, 'chloe', `Expected chloe, got ${results2[0].project}`);
 
-  // Query 3: project filter — only return ProjectA results
-  const results3 = await searchMessages('bash retry', { dbPath: tmpDb, limit: 3, project: 'ProjectA' });
-  assert.ok(results3.length >= 1, 'Should have at least one result');
-  assert.ok(results3.every(r => r.project === 'ProjectA'), 'All results should be from ProjectA');
+    // Query 3: project filter — only return ProjectA results
+    const results3 = await searchMessages('bash retry', { dbPath: tmpDb, limit: 3, project: 'ProjectA' });
+    assert.ok(results3.length >= 1, 'Should have at least one result');
+    assert.ok(results3.every(r => r.project === 'ProjectA'), 'All results should be from ProjectA');
 
-  fs.rmSync(tmpDb, { recursive: true });
-  console.log('test-search.js: all assertions passed');
+    console.log('test-search.js: all assertions passed');
+  } finally {
+    fs.rmSync(tmpDb, { recursive: true, force: true });
+  }
 }
 
 run().catch(err => { console.error(err); process.exit(1); });
