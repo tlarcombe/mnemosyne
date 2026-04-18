@@ -32,6 +32,7 @@ const TABLE_NAME = 'messages';
 const BATCH_SIZE = 32;
 const MAX_TEXT_LEN = 800;
 const MIN_TEXT_LEN = 20;
+const EMBEDDING_DIMS = 384; // all-MiniLM-L6-v2 output dimension
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -108,6 +109,7 @@ function extractMessages(filePath, sessionId, projectName, projectPath) {
   const results = [];
   let msgIndex = 0;
 
+  let parseErrors = 0;
   for (const line of lines) {
     try {
       const d = JSON.parse(line);
@@ -125,7 +127,12 @@ function extractMessages(filePath, sessionId, projectName, projectPath) {
         msg_index: msgIndex++,
         file_mtime: mtime,
       });
-    } catch {}
+    } catch {
+      parseErrors++;
+    }
+  }
+  if (parseErrors > 0) {
+    process.stderr.write(`  [warn] ${path.basename(filePath)}: ${parseErrors} unparseable lines skipped\n`);
   }
   return results;
 }
@@ -160,10 +167,13 @@ async function loadEmbedder() {
  */
 async function embedBatch(embedder, texts) {
   const out = await embedder(texts, { pooling: 'mean', normalize: true });
-  const dims = 384;
+  const expectedLen = texts.length * EMBEDDING_DIMS;
+  if (out.data.length !== expectedLen) {
+    throw new Error(`Unexpected embedding output: got ${out.data.length} values, expected ${expectedLen} (${texts.length} texts × ${EMBEDDING_DIMS} dims)`);
+  }
   const results = [];
   for (let i = 0; i < texts.length; i++) {
-    results.push(Array.from(out.data.slice(i * dims, (i + 1) * dims)));
+    results.push(Array.from(out.data.slice(i * EMBEDDING_DIMS, (i + 1) * EMBEDDING_DIMS)));
   }
   return results;
 }
@@ -242,6 +252,7 @@ async function main() {
     const rows = extractMessages(file, sessionId, projectName, projectPath);
     if (rows.length === 0) {
       manifest[file] = { mtime: Math.floor(fs.statSync(file).mtimeMs / 1000), count: 0 };
+      saveManifest(manifest);
       continue;
     }
 
@@ -261,12 +272,11 @@ async function main() {
     }
 
     manifest[file] = { mtime: Math.floor(fs.statSync(file).mtimeMs / 1000), count: rows.length };
+    saveManifest(manifest);
     totalMessages += rows.length;
     totalSessions++;
     process.stderr.write(`  [${totalSessions}/${toIndex.length}] ${projectName}: ${rows.length} messages\n`);
   }
-
-  saveManifest(manifest);
   process.stderr.write(`[dream-index] Done: ${totalMessages} messages from ${totalSessions} sessions.\n`);
 }
 
