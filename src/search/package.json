@@ -1,0 +1,13 @@
+{
+  "name": "mnemosyne-search",
+  "version": "1.0.0",
+  "description": "Mnemosyne Phase 4 — semantic search over Tier 4 JSONL archive",
+  "main": "dream-index.js",
+  "scripts": {
+    "test": "node ../../tests/search/test-extract.js && node ../../tests/search/test-search.js"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "0.27.2",
+    "@xenova/transformers": "^3.0.0"
+  }
+}
