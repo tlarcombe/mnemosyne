@@ -17,14 +17,14 @@ echo "Target: $CLAUDE_DIR"
 echo ""
 
 # Step 1: Global tier directories
-echo "[1/9] Creating global memory tier directories..."
+echo "[1/10] Creating global memory tier directories..."
 mkdir -p "$MEMORY_DIR/permanent"
 mkdir -p "$MEMORY_DIR/feedback"
 echo "  ~/.claude/memory/permanent/ — OK"
 echo "  ~/.claude/memory/feedback/  — OK"
 
 # Step 2: Seed files (skip if already customised by the user)
-echo "[2/9] Deploying Tier 0 seed files..."
+echo "[2/10] Deploying Tier 0 seed files..."
 for seed in "$MNEMOSYNE_DIR/seeds/permanent/"*.md; do
   target="$MEMORY_DIR/permanent/$(basename "$seed")"
   if [[ ! -f "$target" ]]; then
@@ -36,17 +36,17 @@ for seed in "$MNEMOSYNE_DIR/seeds/permanent/"*.md; do
 done
 
 # Step 3: Mnemosyne SessionStart hook
-echo "[3/9] Deploying mnemosyne-session-start.js..."
+echo "[3/10] Deploying mnemosyne-session-start.js..."
 cp "$MNEMOSYNE_DIR/src/hooks/mnemosyne-session-start.js" "$HOOKS_DIR/"
 echo "  ~/.claude/scripts/hooks/mnemosyne-session-start.js — OK"
 
 # Step 4: /memory-status command
-echo "[4/9] Deploying memory-status command..."
+echo "[4/10] Deploying memory-status command..."
 cp "$MNEMOSYNE_DIR/src/commands/memory-status.md" "$COMMANDS_DIR/"
 echo "  ~/.claude/commands/memory-status.md — OK"
 
 # Step 5: Wire SessionStart hook in settings.json
-echo "[5/9] Wiring Mnemosyne SessionStart hook..."
+echo "[5/10] Wiring Mnemosyne SessionStart hook..."
 node -e "
 const fs = require('fs');
 const p = process.env.HOME + '/.claude/settings.json';
@@ -72,7 +72,7 @@ fs.writeFileSync(p, JSON.stringify(s, null, 2) + '\n');
 "
 
 # Step 6: Patch session-start.js to eliminate context bleed
-echo "[6/9] Applying context bleed fix to session-start.js..."
+echo "[6/10] Applying context bleed fix to session-start.js..."
 SESSION_START="$HOOKS_DIR/session-start.js"
 if grep -q 'Mnemosyne Tier-3 isolation' "$SESSION_START" 2>/dev/null; then
   echo "  Already patched — skipping"
@@ -136,7 +136,7 @@ PATCH_EOF
 fi
 
 # Step 7: Deploy /mnemosyne dream skill
-echo "[7/9] Deploying /mnemosyne dream skill..."
+echo "[7/10] Deploying /mnemosyne dream skill..."
 mkdir -p "$HOME/.claude/skills/mnemosyne"
 cp "$MNEMOSYNE_DIR/src/dream/SKILL.md" "$HOME/.claude/skills/mnemosyne/"
 cp "$MNEMOSYNE_DIR/src/dream/dream-gather.js" "$HOME/.claude/skills/mnemosyne/"
@@ -144,7 +144,7 @@ cp "$MNEMOSYNE_DIR/src/dream/dream-evict.js" "$HOME/.claude/skills/mnemosyne/"
 echo "  ~/.claude/skills/mnemosyne/ — OK (SKILL.md, dream-gather.js, dream-evict.js)"
 
 # Step 8: Deploy mnemosyne-stop.js and wire as async Stop hook
-echo "[8/9] Wiring Mnemosyne Stop hook (assumption extractor)..."
+echo "[8/10] Wiring Mnemosyne Stop hook (assumption extractor)..."
 cp "$MNEMOSYNE_DIR/src/hooks/mnemosyne-stop.js" "$HOOKS_DIR/"
 echo "  ~/.claude/scripts/hooks/mnemosyne-stop.js — OK"
 
@@ -173,11 +173,28 @@ fs.writeFileSync(p, JSON.stringify(s, null, 2) + '\n');
 "
 
 # Step 9: Deploy chloe launcher
-echo "[9/9] Deploying chloe launcher..."
+echo "[9/10] Deploying chloe launcher..."
 mkdir -p "$HOME/.local/bin"
 cp "$MNEMOSYNE_DIR/src/launchers/chloe" "$HOME/.local/bin/chloe"
 chmod +x "$HOME/.local/bin/chloe"
 echo "  ~/.local/bin/chloe — OK"
+
+# Step 10: Deploy Phase 4 vector search
+echo "[10/10] Deploying Phase 4 vector search..."
+SEARCH_DEPLOY="$HOME/.claude/skills/mnemosyne/search"
+mkdir -p "$SEARCH_DEPLOY"
+cp "$MNEMOSYNE_DIR/src/search/dream-index.js" "$SEARCH_DEPLOY/"
+cp "$MNEMOSYNE_DIR/src/search/memory-search.js" "$SEARCH_DEPLOY/"
+cp "$MNEMOSYNE_DIR/src/search/package.json" "$SEARCH_DEPLOY/"
+echo "  Copied search scripts to $SEARCH_DEPLOY"
+
+# Install npm deps in the deploy dir (idempotent)
+npm install --prefix "$SEARCH_DEPLOY" --omit=dev --quiet 2>&1 | tail -3
+echo "  npm deps installed in $SEARCH_DEPLOY/node_modules/"
+
+# Deploy /memory-search command
+cp "$MNEMOSYNE_DIR/src/search/search-skill.md" "$COMMANDS_DIR/memory-search.md"
+echo "  ~/.claude/commands/memory-search.md — OK"
 
 echo ""
 echo "=== Installation complete ==="

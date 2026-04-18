@@ -100,14 +100,16 @@ The installer is **idempotent** — safe to re-run after Claude Code updates.
 
 | Step | Action |
 |------|--------|
-| `[1/8]` | Create `~/.claude/memory/permanent/` and `~/.claude/memory/feedback/` |
-| `[2/8]` | Deploy Tier 0 seed files (skips if already customised) |
-| `[3/8]` | Deploy `mnemosyne-session-start.js` to `~/.claude/scripts/hooks/` |
-| `[4/8]` | Deploy `memory-status.md` to `~/.claude/commands/` |
-| `[5/8]` | Wire `mnemosyne:session:tiers` as first SessionStart hook in `settings.json` |
-| `[6/8]` | Patch `session-start.js` to fix cross-project context bleed |
-| `[7/8]` | Deploy `/mnemosyne` dream skill to `~/.claude/skills/mnemosyne/` |
-| `[8/8]` | Deploy `mnemosyne-stop.js` and wire it as async Stop hook |
+| `[1/10]` | Create `~/.claude/memory/permanent/` and `~/.claude/memory/feedback/` |
+| `[2/10]` | Deploy Tier 0 seed files (skips if already customised) |
+| `[3/10]` | Deploy `mnemosyne-session-start.js` to `~/.claude/scripts/hooks/` |
+| `[4/10]` | Deploy `memory-status.md` to `~/.claude/commands/` |
+| `[5/10]` | Wire `mnemosyne:session:tiers` as first SessionStart hook in `settings.json` |
+| `[6/10]` | Patch `session-start.js` to fix cross-project context bleed |
+| `[7/10]` | Deploy `/mnemosyne` dream skill to `~/.claude/skills/mnemosyne/` |
+| `[8/10]` | Deploy `mnemosyne-stop.js` and wire it as async Stop hook |
+| `[9/10]` | Deploy `chloe` launcher to `~/.local/bin/chloe` |
+| `[10/10]` | Deploy Phase 4 search scripts, `npm install`, deploy `/memory-search` command |
 
 ### Post-install steps
 
@@ -317,7 +319,7 @@ cat ~/.claude/projects/-home-you-projects-myproject/memory/assumptions.md
 | **Phase 1** — Foundations | ✅ Complete | Schema migration, Tier 0/1 injection, context bleed fix, `/memory-status` |
 | **Phase 2** — Dream Rebuilt | ✅ Complete | 5-phase CIA dream cycle, scoring function, bitemporal eviction, run report |
 | **Phase 3** — Assumption Register | ✅ Complete | Stop hook extraction, `assumptions.md`, SessionStart surfacing |
-| **Phase 4** — Vector Search | Planned | ChromaDB indexing of Tier 4 JSONL, `/memory-search` command |
+| **Phase 4** — Vector Search | ✅ Complete | LanceDB (embedded) + all-MiniLM-L6-v2 embeddings, `/memory-search` command, dream cycle integration |
 
 ---
 
