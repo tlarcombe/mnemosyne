@@ -212,6 +212,42 @@ Keep MEMORY.md under 200 lines. If over, move oldest entries to `archive.md`.
 
 ---
 
+## Phase 6: INDEX_VECTORS
+
+**Goal:** Incrementally update the LanceDB vector index with sessions from the last 30 days.
+
+### 6a: Check search deps are installed
+
+```bash
+ls ~/.claude/skills/mnemosyne/search/node_modules/@lancedb 2>/dev/null && echo "deps OK" || echo "MISSING — run: bash ~/projects/Mnemosyne/install.sh"
+```
+
+If missing: stop and tell the user to re-run the installer.
+
+### 6b: Run incremental index
+
+```bash
+node ~/.claude/skills/mnemosyne/search/dream-index.js --days 30 2>&1
+```
+
+Expected output ends with: `[dream-index] Done: N messages from M sessions.`
+
+If it reports `Nothing to index`, all recent sessions are already indexed — that's fine.
+
+### 6c: Verify index stats
+
+```bash
+node -e "
+const d = JSON.parse(require('fs').readFileSync(process.env.HOME + '/.claude/lancedb/indexed.json', 'utf8'));
+const total = Object.values(d).reduce((s, v) => s + v.count, 0);
+console.log('Vector index: ' + Object.keys(d).length + ' sessions, ' + total + ' messages');
+"
+```
+
+Add the vector index stats to the Dream Run Report under a `## Vector Index` section.
+
+---
+
 ## Dream Run Report
 
 Write the run report after completing all 5 phases:
