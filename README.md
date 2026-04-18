@@ -6,6 +6,8 @@ Mnemosyne implements a structured 5-tier memory architecture for [Claude Code](h
 
 This is not a standalone application — it is a set of hooks, skills, and scripts that integrate directly with the `~/.claude/` infrastructure.
 
+![Mnemosyne Architecture](docs/mnemosyne_architecture.png)
+
 ---
 
 ## The Problem
