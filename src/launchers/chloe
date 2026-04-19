@@ -13,6 +13,10 @@ CONTINUE_STATE_FILE="$HOME/.claude/continue-state.json"
 # Base flags: always passed to claude. --add-dir makes ~/.claude hooks/memory available.
 BASE_CLAUDE_ARGS=(--permission-mode bypassPermissions --add-dir "$HOME/.claude")
 
+set_title() {
+    printf '\033]2;%s\007' "$1"
+}
+
 # Launch claude with automatic rate-limit retry.
 # Uses `script` to transparently capture terminal output.
 # After claude exits, checks for rate limit message. If found,
@@ -310,6 +314,7 @@ PYEOF
     echo "  Resuming $project_name..."
     sleep 1
     cd "$project_path"
+    set_title "$project_name"
     launch_claude --continue || true
 }
 
@@ -1279,6 +1284,7 @@ main() {
     # Esc/Ctrl-C in fzf breaks the loop and exits the tmux session.
     clear
     while true; do
+        set_title "chloe"
         local project_list
         project_list=$(build_project_list)
 
@@ -1434,6 +1440,7 @@ main() {
                 echo "Directory already exists: $new_dir" >&2
                 echo "Launching Claude in existing directory..."
                 cd "$new_dir"
+                set_title "$project_name"
                 launch_claude || true
                 continue
             fi
@@ -1442,6 +1449,7 @@ main() {
             cd "$new_dir"
             touch CLAUDE.md
             echo "Created project (no git): $new_dir"
+            set_title "$project_name"
             launch_claude || true
             continue
         fi
@@ -1459,6 +1467,7 @@ main() {
                 echo "Directory already exists: $new_dir" >&2
                 echo "Launching Claude in existing directory..."
                 cd "$new_dir"
+                set_title "$project_name"
                 launch_claude || true
                 continue
             fi
@@ -1468,6 +1477,7 @@ main() {
             git init
             touch CLAUDE.md
             echo "Created project: $new_dir"
+            set_title "$project_name"
             launch_claude || true
             continue
         fi
@@ -1488,6 +1498,7 @@ main() {
             continue
         fi
 
+        set_title "$(basename "$selected_path")"
         if [[ "$has_sessions_flag" =~ ^(1|L)$ ]]; then
             echo "Resuming in: $selected_path"
             launch_claude --continue || true
