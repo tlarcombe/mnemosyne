@@ -14,7 +14,11 @@ CONTINUE_STATE_FILE="$HOME/.claude/continue-state.json"
 BASE_CLAUDE_ARGS=(--permission-mode bypassPermissions --add-dir "$HOME/.claude")
 
 set_title() {
-    printf '\033]2;%s\007' "$1"
+    local title="$1"
+    if [ -n "${TMUX:-}" ]; then
+        tmux rename-window "$title"
+    fi
+    printf '\033]2;%s\007' "$title"
 }
 
 # Launch claude with automatic rate-limit retry.
