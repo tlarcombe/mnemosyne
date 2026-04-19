@@ -638,7 +638,8 @@ for session_dir, proj_path in pairs:
 results.sort(reverse=True)
 for _, jf, proj_path, display in results:
     print(f"{jf}\t{proj_path}\t{display}")
-PYEOF)
+PYEOF
+)
 
     if [ -z "$results" ]; then
         echo "  No matches found for: $query"
