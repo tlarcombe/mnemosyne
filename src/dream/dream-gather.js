@@ -24,6 +24,23 @@ const os = require('os');
 const HOME = os.homedir();
 const PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
 
+// Messages that match these prefixes are system-injected context, not user intent.
+// Skill invocations inject their full body as a user message; session continuations
+// and task notifications are similarly synthetic. All produce high false-positive rates.
+const NOISE_PREFIXES = [
+  'Base directory for this skill:',
+  'This session is being continued from a previous conversation',
+  '<task-notification>',
+  '<system-reminder>',
+  '# Mnemosyne',          // project brief injections
+  '# Session:',           // ECC session summaries
+];
+
+function isNoiseMessage(text) {
+  const trimmed = text.trimStart();
+  return NOISE_PREFIXES.some(prefix => trimmed.startsWith(prefix));
+}
+
 const SIGNAL_PATTERNS = [
   { pattern: /\b(actually|no,\s|wrong|incorrect|not right|stop doing|don't do that|that's not|correction|I said|I meant)\b/i, category: 'correction', weight: 1.0 },
   { pattern: /\b(I prefer|always use|never use|I like|I don't like|I want you to|from now on|going forward|remember that|keep in mind|make sure to|default to)\b/i, category: 'preference', weight: 0.85 },
@@ -91,6 +108,7 @@ function scanFile(filePath, projectName) {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role !== 'user') continue;
+    if (isNoiseMessage(msg.text)) continue;
 
     for (const { pattern, category, weight } of SIGNAL_PATTERNS) {
       if (!pattern.test(msg.text)) continue;
