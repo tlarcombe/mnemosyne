@@ -1268,10 +1268,21 @@ PYEOF
 
 # Main
 main() {
+    # Parse flags
+    local use_tmux=1
+    local args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --no-tmux) use_tmux=0 ;;
+            *) args+=("$arg") ;;
+        esac
+    done
+    set -- "${args[@]+"${args[@]}"}"
+
     # Run inside a named tmux session so it can be attached from anywhere.
-    # Skip if already inside tmux (TMUX is set) or if we were launched by tmux
-    # (CLAUDE_IN_TMUX is set, preventing infinite re-launch).
-    if [ -z "${TMUX:-}" ] && [ -z "${CLAUDE_IN_TMUX:-}" ]; then
+    # Skip if already inside tmux (TMUX is set), launched by tmux (CLAUDE_IN_TMUX),
+    # or if --no-tmux was passed.
+    if [ "$use_tmux" = "1" ] && [ -z "${TMUX:-}" ] && [ -z "${CLAUDE_IN_TMUX:-}" ]; then
         if tmux has-session -t "chloe" 2>/dev/null; then
             exec tmux attach-session -t "chloe"
         else
