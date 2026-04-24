@@ -457,6 +457,25 @@ def rel_date(ts):
     if s < 2592000: return f"{s//604800}w ago"
     return dt.strftime('%Y-%m-%d')
 
+def last_slash_command(f, size):
+    """Scan the tail of a JSONL file for the most recent slash command name."""
+    try:
+        tail_bytes = 262144  # 256 KB — avoids OOM on multi-GB transcripts
+        with open(f, 'rb') as fh:
+            fh.seek(max(0, size - tail_bytes))
+            tail = fh.read().decode('utf-8', errors='replace')
+        close_tag = '</command-name>'
+        open_tag  = '<command-name>'
+        idx = tail.rfind(close_tag)
+        if idx < 0:
+            return ''
+        open_idx = tail.rfind(open_tag, 0, idx)
+        if open_idx < 0:
+            return ''
+        return tail[open_idx + len(open_tag):idx].strip()
+    except Exception:
+        return ''
+
 sessions = []
 for f in files:
     try:
@@ -482,20 +501,22 @@ for f in files:
                                 first_msg = content.strip().replace('\n', ' ')
                 except Exception:
                     pass
-        sessions.append((mtime, f, first_msg[:75], user_count, size))
+        last_cmd = last_slash_command(f, size)
+        sessions.append((mtime, f, first_msg[:75], user_count, size, last_cmd))
     except Exception:
         pass
 
 sessions.sort(reverse=True)
 
-for i, (mtime, f, first_msg, user_count, size) in enumerate(sessions):
+for i, (mtime, f, first_msg, user_count, size, last_cmd) in enumerate(sessions):
     date_str = rel_date(mtime)
     sz       = f"{size//1024}KB" if size < 1048576 else f"{size//1048576}MB"
     summary  = first_msg if first_msg else "(empty session)"
     marker   = "\033[32m●\033[0m" if i == 0 else "\033[2m○\033[0m"
+    cmd_part = f"  \033[2;35m{last_cmd}\033[0m" if last_cmd else ""
     display  = (f"{marker}  \033[2m{date_str}\033[0m"
                 f"  \033[33m{user_count}q\033[0m  \033[2m{sz}\033[0m"
-                f"  {summary}")
+                f"{cmd_part}  {summary}")
     print(f"{f}\t{display}")
 PYEOF
 }
