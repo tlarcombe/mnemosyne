@@ -9,11 +9,15 @@
  * Injects Tier 0 (permanent global) and Tier 1 (global feedback) memory content
  * into every session via the Claude Code SessionStart additionalContext mechanism.
  *
+ * Phase 5 additions:
+ *   - Pending lesson verification: surfaces unverified lessons from recent sessions
+ *   - Episode loading: injects the 3 most recent episodic summaries for current project
+ *
  * Project-scoped memories (Tier 2) are handled by Claude Code's native auto-memory.
  * Session summaries (Tier 3) are handled by the existing ECC session-start.js.
  *
- * Token budget: 3000 tokens total (chars / 4 approximation).
- * Tier 0 always loads in full. Tier 1 loads up to the remaining budget.
+ * Token budget: 5000 tokens total (chars / 4 approximation).
+ * Tier 0 always loads in full. Remaining budget shared by Tier 1, episodes, pending lessons.
  * Tier 1 entries with expired or superseded valid_until are skipped.
  * Tier 1 capped at 50 entries per spec.
  */
@@ -26,10 +30,15 @@ const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
 const PERMANENT_DIR = path.join(CLAUDE_DIR, 'memory', 'permanent');
 const FEEDBACK_DIR = path.join(CLAUDE_DIR, 'memory', 'feedback');
+const EPISODES_BASE_DIR = path.join(CLAUDE_DIR, 'memory', 'episodes');
 
-const TOKEN_BUDGET = 3000;
+const TOKEN_BUDGET = 5000;
 const CHARS_PER_TOKEN = 4;
 const CHAR_BUDGET = TOKEN_BUDGET * CHARS_PER_TOKEN;
+
+const EPISODE_CHAR_CAP = 6000;
+const PENDING_CHAR_CAP = 1200;
+const MAX_EPISODES = 3;
 
 function estimateTokens(text) {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
@@ -39,7 +48,7 @@ function readMemoryFiles(dir) {
   if (!fs.existsSync(dir)) return [];
 
   return fs.readdirSync(dir)
-    .filter(f => f.endsWith('.md'))
+    .filter(f => f.endsWith('.md') && f !== 'MEMORY.md')
     .sort()
     .map(f => {
       const filePath = path.join(dir, f);
@@ -106,16 +115,70 @@ function buildSection(tier, files, charBudget) {
   return { text: parts.join('\n\n'), charsUsed };
 }
 
+function encodeProjectPath(p) {
+  // Claude Code encodes project paths by replacing all non-alphanumeric chars with '-'
+  return p.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
 function findProjectDir(cwd) {
-  // Walk up the directory tree — sessions may run in subdirs of the project root
   let current = cwd;
   while (current && current !== path.dirname(current)) {
-    const encoded = current.replace(/\//g, '-');
+    const encoded = encodeProjectPath(current);
     const projectDir = path.join(CLAUDE_DIR, 'projects', encoded);
-    if (fs.existsSync(projectDir)) return projectDir;
+    if (fs.existsSync(projectDir)) return { projectDir, encodedDir: encoded };
     current = path.dirname(current);
   }
   return null;
+}
+
+function projectLabel(encodedDir) {
+  const parts = encodedDir.replace(/^-/, '').split('-');
+  const idx = parts.indexOf('projects');
+  if (idx !== -1) return parts.slice(idx + 1).join('-');
+  return encodedDir;
+}
+
+function loadRecentEpisodes(encodedDir, charBudget) {
+  const label = projectLabel(encodedDir);
+  const epDir = path.join(EPISODES_BASE_DIR, label);
+  if (!fs.existsSync(epDir)) return { text: '', charsUsed: 0, count: 0 };
+
+  const files = fs.readdirSync(epDir)
+    .filter(f => f.endsWith('.md') && !f.includes('pending') && f !== 'MEMORY.md')
+    .sort().reverse()
+    .slice(0, MAX_EPISODES);
+
+  if (files.length === 0) return { text: '', charsUsed: 0, count: 0 };
+
+  const parts = [];
+  let charsUsed = 0;
+  for (const file of files) {
+    try {
+      const content = fs.readFileSync(path.join(epDir, file), 'utf8').trim();
+      const body = stripFrontmatter(content);
+      if (!body) continue;
+      const entry = `### ${file.replace('.md', '')}\n${body}`;
+      if (charsUsed + entry.length > charBudget) break;
+      parts.push(entry);
+      charsUsed += entry.length;
+    } catch { /* skip */ }
+  }
+
+  return { text: parts.join('\n\n---\n\n'), charsUsed, count: parts.length };
+}
+
+function loadPendingLessons(encodedDir, charBudget) {
+  const label = projectLabel(encodedDir);
+  const pendingPath = path.join(EPISODES_BASE_DIR, label, 'pending-lessons.md');
+  if (!fs.existsSync(pendingPath)) return { text: '', charsUsed: 0 };
+  try {
+    const content = fs.readFileSync(pendingPath, 'utf8').trim();
+    const body = stripFrontmatter(content);
+    if (!body || body.length > charBudget) return { text: '', charsUsed: 0 };
+    return { text: body, charsUsed: body.length };
+  } catch {
+    return { text: '', charsUsed: 0 };
+  }
 }
 
 function loadTopAssumptions(projectDir, maxCount) {
@@ -156,7 +219,9 @@ function main() {
     .slice(0, 50);
 
   const cwd = (event && event.cwd) ? event.cwd : process.cwd();
-  const projectDir = findProjectDir(cwd);
+  const found = findProjectDir(cwd);
+  const projectDir = found ? found.projectDir : null;
+  const encodedDir = found ? found.encodedDir : null;
   const assumptionLines = projectDir ? loadTopAssumptions(projectDir, 3) : [];
 
   if (tier0Files.length === 0 && tier1Files.length === 0 && assumptionLines.length === 0) {
@@ -188,6 +253,22 @@ function main() {
     if (assumptionText.length <= remainingChars && assumptionText.length <= 1200) {
       sections.push(assumptionText);
       remainingChars -= assumptionText.length;
+    }
+  }
+
+  if (encodedDir && remainingChars > 0) {
+    const { text, charsUsed } = loadPendingLessons(encodedDir, Math.min(remainingChars, PENDING_CHAR_CAP));
+    if (text) {
+      sections.push(`## Pending Lesson Verification\n\n${text}\n\n*Please confirm, correct, or add to these.*`);
+      remainingChars -= charsUsed;
+    }
+  }
+
+  if (encodedDir && remainingChars > 0) {
+    const { text, charsUsed, count } = loadRecentEpisodes(encodedDir, Math.min(remainingChars, EPISODE_CHAR_CAP));
+    if (text) {
+      sections.push(`## Recent Episodes (${count})\n\n${text}`);
+      remainingChars -= charsUsed;
     }
   }
 
