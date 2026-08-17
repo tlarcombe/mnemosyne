@@ -34,6 +34,7 @@ const NOISE_PREFIXES = [
   '<system-reminder>',
   '# Mnemosyne',          // project brief injections
   '# Session:',           // ECC session summaries
+  'You are writing an episodic memory entry for a memory system called Mnemosyne', // dream-narrate.js prompt (embeds full conversation dump, causing self-matches)
 ];
 
 function isNoiseMessage(text) {
