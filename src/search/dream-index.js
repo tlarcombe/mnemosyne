@@ -34,6 +34,21 @@ const MAX_TEXT_LEN = 800;
 const MIN_TEXT_LEN = 20;
 const EMBEDDING_DIMS = 384; // all-MiniLM-L6-v2 output dimension
 
+// Harness/system boilerplate that carries no semantic signal. Left unfiltered
+// it forms whole noise clusters in topology (e.g. "No response requested.",
+// "[Request interrupted by user]", slash-command wrappers, task notifications).
+const NOISE_PATTERNS = [
+  /^No response requested\.?$/,
+  /^\[Request interrupted by user[^\]]*\]$/,
+  /^<(local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args)>/,
+  /^<task-notification>/,
+  /^Continue from where you left off\.?$/,
+];
+
+function isNoise(text) {
+  return NOISE_PATTERNS.some(p => p.test(text));
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -116,7 +131,7 @@ function extractMessages(filePath, sessionId, projectName, projectPath) {
       const role = d.message && d.message.role;
       if (role !== 'user' && role !== 'assistant') continue;
       const text = extractText(d.message.content);
-      if (!text || text.length < MIN_TEXT_LEN) continue;
+      if (!text || text.length < MIN_TEXT_LEN || isNoise(text)) continue;
       results.push({
         text: text.slice(0, MAX_TEXT_LEN),
         role,
@@ -268,6 +283,8 @@ async function main() {
     if (table === null) {
       table = await db.createTable(TABLE_NAME, lanceRows);
     } else {
+      // Replace, don't append: a changed session file is re-extracted in full.
+      await table.delete(`file_path = '${file.replace(/'/g, "''")}'`);
       await table.add(lanceRows);
     }
 
@@ -284,4 +301,4 @@ if (require.main === module) {
   main().catch(err => { process.stderr.write(err.stack + '\n'); process.exit(1); });
 }
 
-module.exports = { extractMessages, getProjectName, extractText };
+module.exports = { extractMessages, getProjectName, extractText, isNoise };

@@ -56,3 +56,15 @@ const { extractMessages, getProjectName } = require('../../src/search/dream-inde
 }
 
 console.log('test-extract.js: all assertions passed');
+
+// isNoise filters harness boilerplate that would otherwise form noise clusters
+{
+  const assert = require('assert');
+  const { isNoise } = require('../../src/search/dream-index.js');
+  assert.strictEqual(isNoise('No response requested.'), true);
+  assert.strictEqual(isNoise('[Request interrupted by user for tool use]'), true);
+  assert.strictEqual(isNoise('<command-name>/loop</command-name>'), true);
+  assert.strictEqual(isNoise('<task-notification><task-id>x</task-id>'), true);
+  assert.strictEqual(isNoise('Please deploy the blog to production'), false);
+  console.log('isNoise: OK');
+}
