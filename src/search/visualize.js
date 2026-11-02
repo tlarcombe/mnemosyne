@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { projectGroup } = require('./project-group.js');
+const { createScrubber } = require('./scrub.js');
 
 const DB_PATH = path.join(os.homedir(), '.claude/lancedb');
 const OUT_PATH = path.join(os.homedir(), 'Documents/mnemosyne-viz.html');
@@ -27,11 +28,15 @@ async function main() {
     .toArray();
   console.log(`Loaded ${rows.length} messages from ${countProjects(rows)} projects`);
 
+  // Scrub before truncating so a secret on the cut boundary can't leak a prefix.
+  const scrub = createScrubber();
+  console.log(`Secret scrubber: ${scrub.knownCount} known values loaded`);
+
   const vectors = rows.map(r => Array.from(r.vector));
   const meta = rows.map(r => {
     const { group, sub } = projectGroup(r.project_path, r.project);
     return {
-      t: truncate(r.text, 400),
+      t: truncate(scrub(r.text), 400),
       r: r.role,
       p: group,
       u: sub,

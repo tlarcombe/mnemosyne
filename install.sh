@@ -189,6 +189,7 @@ cp "$MNEMOSYNE_DIR/src/search/project-group.js" "$SEARCH_DEPLOY/"
 cp "$MNEMOSYNE_DIR/src/search/dream-topology.js" "$SEARCH_DEPLOY/"
 cp "$MNEMOSYNE_DIR/src/search/prepare-viz.js" "$SEARCH_DEPLOY/"
 cp "$MNEMOSYNE_DIR/src/search/visualize.js" "$SEARCH_DEPLOY/"
+cp "$MNEMOSYNE_DIR/src/search/scrub.js" "$SEARCH_DEPLOY/"
 cp "$MNEMOSYNE_DIR/src/search/package.json" "$SEARCH_DEPLOY/"
 echo "  Copied search scripts to $SEARCH_DEPLOY"
 

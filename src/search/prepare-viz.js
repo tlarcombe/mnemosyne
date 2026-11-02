@@ -16,6 +16,7 @@
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
+const { createScrubber } = require('./scrub.js');
 
 const args      = process.argv.slice(2);
 const outIdx    = args.indexOf('--out');
@@ -67,12 +68,14 @@ process.stdout.write(`[prepare-viz] ${safe.clusters.length} clusters, ${safe.sad
 // Points file — truncate text to 150 chars, keep cluster id and project
 if (fs.existsSync(SRC_PTS)) {
   const pts = JSON.parse(fs.readFileSync(SRC_PTS, 'utf8'));
+  const scrub = createScrubber();
   const safePts = {
     generated_at: pts.generated_at,
     k:            pts.k,
+    // Scrub before truncating so a secret on the cut boundary can't leak a prefix.
     points: pts.points.map(([ci, text, project, subproject]) => [
       ci,
-      (text || '').slice(0, 150),
+      scrub(text || '').slice(0, 150),
       project || '',
       subproject || '',
     ]),
