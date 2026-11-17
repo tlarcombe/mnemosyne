@@ -25,6 +25,18 @@ const path = require('path');
 const os = require('os');
 const { execSync, spawnSync } = require('child_process');
 
+// scrub.js lives in src/search/ in the repo and in search/ next to this file
+// once installed in ~/.claude/skills/mnemosyne/.
+const { createScrubber } = require(
+  [path.join(__dirname, 'search', 'scrub.js'), path.join(__dirname, '..', 'search', 'scrub.js')]
+    .find(p => fs.existsSync(p)) || './search/scrub.js'
+);
+let scrubber = null;
+function scrub(text) {
+  if (!scrubber) scrubber = createScrubber();
+  return scrubber(text || '');
+}
+
 const HOME = os.homedir();
 const PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
 const EPISODES_DIR = path.join(HOME, '.claude', 'memory', 'episodes');
@@ -92,8 +104,11 @@ function extractConversation(filePath) {
     try {
       const d = JSON.parse(line);
       if (d.type !== 'user' && d.type !== 'assistant') continue;
-      const text = extractText(d).trim();
-      if (!text || isNoise(text)) continue;
+      const raw = extractText(d).trim();
+      if (!raw || isNoise(raw)) continue;
+      // Scrub before truncating (a cut can split a secret past recognition)
+      // and before the text is sent to Claude for narration.
+      const text = scrub(raw);
       messages.push({
         role: d.type === 'user' ? 'Tony' : 'Claude',
         text: text.length > MAX_MSG_CHARS ? text.slice(0, MAX_MSG_CHARS) + '…' : text,
@@ -323,7 +338,9 @@ async function main() {
           continue;
         }
 
-        const { narrative, lessons } = parseNarrativeOutput(output);
+        const parsed = parseNarrativeOutput(output);
+        const narrative = scrub(parsed.narrative);
+        const lessons = parsed.lessons.map(scrub);
         const episodePath = writeEpisode(epDir, sessionDate, projName, narrative, filePath);
         appendPendingLessons(epDir, sessionDate, projName, lessons);
 

@@ -32,6 +32,7 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 const { projectGroup } = require('./project-group.js');
+const { createScrubber } = require('./scrub.js');
 
 const HOME       = os.homedir();
 const DB_DIR     = path.join(HOME, '.claude', 'lancedb');
@@ -309,11 +310,15 @@ async function main() {
 
   // Load all rows. We need text + vector for both clustering and bridge detection.
   const rawRows = await table.query().limit(200000).toArray();
+  // Scrub secrets once at load: every text written to void-topology.json,
+  // void-points.json and stdout derives from allRows, and ~/.claude/memory is
+  // backed up offsite nightly.
+  const scrub = createScrubber();
   const allRows = rawRows.map(r => {
     const { group, sub } = projectGroup(r.project_path, r.project);
     return {
       vector:     Array.from(r.vector),   // plain array for bridge search
-      text:       r.text,
+      text:       scrub(r.text || ''),
       project:    group,
       subproject: sub,
       session_id: r.session_id,
