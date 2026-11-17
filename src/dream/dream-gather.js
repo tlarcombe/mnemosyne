@@ -42,6 +42,15 @@ function isNoiseMessage(text) {
   return NOISE_PREFIXES.some(prefix => trimmed.startsWith(prefix));
 }
 
+// Real corrections and preferences are short. Longer messages are pasted
+// material (applications, speeches, emails, prompts) that trips the patterns.
+const MAX_SIGNAL_CHARS = 1500;
+
+/** The user's own words: pasted blocks removed. */
+function signalText(text) {
+  return text.replace(/<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content\b[^>]*>/gi, ' ').trim();
+}
+
 const SIGNAL_PATTERNS = [
   { pattern: /\b(actually|no,\s|wrong|incorrect|not right|stop doing|don't do that|that's not|correction|I said|I meant)\b/i, category: 'correction', weight: 1.0 },
   { pattern: /\b(I prefer|always use|never use|I like|I don't like|I want you to|from now on|going forward|remember that|keep in mind|make sure to|default to)\b/i, category: 'preference', weight: 0.85 },
@@ -110,9 +119,11 @@ function scanFile(filePath, projectName) {
     const msg = messages[i];
     if (msg.role !== 'user') continue;
     if (isNoiseMessage(msg.text)) continue;
+    const own = signalText(msg.text);
+    if (!own || own.length > MAX_SIGNAL_CHARS) continue;
 
     for (const { pattern, category, weight } of SIGNAL_PATTERNS) {
-      if (!pattern.test(msg.text)) continue;
+      if (!pattern.test(own)) continue;
 
       const response = messages[i + 1] && messages[i + 1].role === 'assistant'
         ? messages[i + 1].text.slice(0, 200)
@@ -124,7 +135,7 @@ function scanFile(filePath, projectName) {
         sessionDate,
         category,
         signalWeight: weight,
-        userMessage: msg.text.slice(0, 300),
+        userMessage: own.slice(0, 300),
         assistantResponse: response,
       });
       break; // one signal per user message
@@ -198,4 +209,6 @@ function main() {
   process.stderr.write(`[dream-gather] Scanned ${scannedFiles} sessions, found ${allCandidates.length} signal candidates\n`);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { scanFile, signalText, isNoiseMessage };

@@ -141,7 +141,8 @@ mkdir -p "$HOME/.claude/skills/mnemosyne"
 cp "$MNEMOSYNE_DIR/src/dream/SKILL.md" "$HOME/.claude/skills/mnemosyne/"
 cp "$MNEMOSYNE_DIR/src/dream/dream-gather.js" "$HOME/.claude/skills/mnemosyne/"
 cp "$MNEMOSYNE_DIR/src/dream/dream-evict.js" "$HOME/.claude/skills/mnemosyne/"
-echo "  ~/.claude/skills/mnemosyne/ — OK (SKILL.md, dream-gather.js, dream-evict.js)"
+cp "$MNEMOSYNE_DIR/src/dream/dream-narrate.js" "$HOME/.claude/skills/mnemosyne/"
+echo "  ~/.claude/skills/mnemosyne/ — OK (SKILL.md, dream-gather.js, dream-evict.js, dream-narrate.js)"
 
 # Step 8: Deploy mnemosyne-stop.js and wire as async Stop hook
 echo "[8/10] Wiring Mnemosyne Stop hook (assumption extractor)..."
