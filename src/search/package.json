@@ -4,7 +4,7 @@
   "description": "Mnemosyne Phase 4 \u2014 semantic search over Tier 4 JSONL archive",
   "main": "dream-index.js",
   "scripts": {
-    "test": "node ../../tests/search/test-scrub.js && node ../../tests/search/test-extract.js && node ../../tests/search/test-search.js && node ../../tests/search/test-project-group.js && node ../../tests/dream/test-gather.js"
+    "test": "node ../../tests/search/test-scrub.js && node ../../tests/search/test-extract.js && node ../../tests/search/test-search.js && node ../../tests/search/test-project-group.js && node ../../tests/dream/test-gather.js && node ../../tests/search/test-topology.js"
   },
   "dependencies": {
     "@lancedb/lancedb": "0.27.2",

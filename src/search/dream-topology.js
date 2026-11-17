@@ -209,6 +209,42 @@ function findSaddle(cA, cB, sampleMat, sampleN, steps = 35) {
  * How empty is the region at `point` relative to the overall mean density?
  * Returns a value in [0,1]: 1 = completely empty, 0 = as dense as average.
  */
+/**
+ * Mean-centre unit vectors and renormalise. Returns new arrays (input untouched)
+ * and the mean that was removed.
+ *
+ * Sentence embeddings share a large common direction (mean-vector norm ~0.34
+ * on this index). Left in, every path between two clusters bends toward that
+ * dense core, so the density minimum lands on an endpoint (25 of 28 saddles at
+ * t = 0 or 1 before this, 1 of 28 after) and all saddles touching a cluster
+ * collapse onto the same nearest message.
+ */
+function centerVectors(vectors) {
+  const n = vectors.length;
+  const mean = new Array(DIMS).fill(0);
+  if (n === 0) return { vectors: [], mean };
+  for (const v of vectors) for (let d = 0; d < DIMS; d++) mean[d] += v[d] / n;
+  const centred = vectors.map(v => normalise(v.map((x, d) => x - mean[d])));
+  return { vectors: centred, mean };
+}
+
+/**
+ * Typical density where messages actually are: the median density over up to
+ * `probes` evenly spaced sample points. This is the void-score baseline. (The
+ * old baseline, density at the normalised global mean, is meaningless after
+ * mean-centring because the mean is ~0.)
+ */
+function typicalDensity(sampleMat, sampleN, probes = 300) {
+  if (sampleN === 0) return 0;
+  const step = Math.max(1, Math.floor(sampleN / probes));
+  const ds = [];
+  for (let si = 0; si < sampleN; si += step) {
+    ds.push(densityAt(Array.from(sampleMat.subarray(si * DIMS, (si + 1) * DIMS)), sampleMat, sampleN));
+  }
+  ds.sort((a, b) => a - b);
+  return ds[Math.floor(ds.length / 2)];
+}
+
 function voidScore(point, sampleMat, sampleN, globalDensity) {
   const local = densityAt(point, sampleMat, sampleN);  // same σ as globalDensity
   return Math.max(0, Math.min(1, 1 - local / (globalDensity + 1e-12)));
@@ -249,21 +285,20 @@ function labelCluster(rows) {
 // ── Betti approximations ──────────────────────────────────────────────────────
 
 /**
- * B₀: count clusters that are farther than `threshold` from every other cluster.
- * These are "islands" — surrounded by empty space, no nearby neighbours.
+ * B0: clusters cut off from every other cluster, i.e. every saddle touching
+ * the cluster is a void (void_score > threshold). Uses the same density
+ * evidence and threshold as B1, so there is no distance scale to calibrate.
  */
-function approxB0(centroids, k, threshold = 0.50) {
+function approxB0(saddleGrid, k, voidThreshold = 0.70) {
   let isolated = 0;
   for (let i = 0; i < k; i++) {
-    let hasNeighbour = false;
-    for (let j = 0; j < k; j++) {
+    let linked = false;
+    for (let j = 0; j < k && !linked; j++) {
       if (i === j) continue;
-      if (cosDist(centroids, i * DIMS, centroids, j * DIMS) < threshold) {
-        hasNeighbour = true;
-        break;
-      }
+      const sp = i < j ? saddleGrid[i]?.[j] : saddleGrid[j]?.[i];
+      if (sp && sp.void_score <= voidThreshold) linked = true;
     }
-    if (!hasNeighbour) isolated++;
+    if (!linked) isolated++;
   }
   return isolated;
 }
@@ -314,7 +349,7 @@ async function main() {
   // void-points.json and stdout derives from allRows, and ~/.claude/memory is
   // backed up offsite nightly.
   const scrub = createScrubber();
-  const allRows = rawRows.map(r => {
+  const loadedRows = rawRows.map(r => {
     const { group, sub } = projectGroup(r.project_path, r.project);
     return {
       vector:     Array.from(r.vector),   // plain array for bridge search
@@ -324,8 +359,14 @@ async function main() {
       session_id: r.session_id,
     };
   });
+  log(`[topology] Loaded ${loadedRows.length} rows.`);
+
+  // Topology runs in mean-centred space (see centerVectors). Stored LanceDB
+  // vectors are unchanged; only this analysis uses the centred copies.
+  const { vectors: centred, mean: sharedDir } = centerVectors(loadedRows.map(r => r.vector));
+  const allRows = loadedRows.map((r, i) => ({ ...r, vector: centred[i] }));
   const N = allRows.length;
-  log(`[topology] Loaded ${N} rows.`);
+  log(`[topology] Mean-centred vectors (shared component norm ${Math.hypot(...sharedDir).toFixed(3)}).`);
 
   // Build flat typed-array matrix for fast k-means.
   // For the clustering sample, pick evenly-spaced indices if N > MAX_SAMPLE.
@@ -362,13 +403,7 @@ async function main() {
 
   // Compute global density baseline using the sample matrix.
   log('[topology] Computing global density baseline...');
-  const globalCentroid = Array.from({ length: DIMS }, (_, d) => {
-    let s = 0;
-    for (let si = 0; si < sampleN; si++) s += sampleMat[si * DIMS + d];
-    return s / sampleN;
-  });
-  normalise(globalCentroid);
-  const globalDensity = densityAt(globalCentroid, sampleMat, sampleN);
+  const globalDensity = typicalDensity(sampleMat, sampleN);
 
   // Extract cluster centroid plain arrays for saddle computation.
   const centroidArrays = Array.from({ length: K }, (_, ci) =>
@@ -404,7 +439,7 @@ async function main() {
   }
 
   log('[topology] Computing Betti approximations...');
-  const B0 = approxB0(centroids, K, 0.50);
+  const B0 = approxB0(saddleGrid, K, 0.70);
   const B1 = approxB1(saddleGrid, K, 0.70);
 
   // Sort saddle points: highest void score first (most interesting).
@@ -503,4 +538,4 @@ if (require.main === module) {
   main().catch(err => { process.stderr.write(err.stack + '\n'); process.exit(1); });
 }
 
-module.exports = { kMeans, findSaddle, voidScore, nearestMessages, cosDistArr };
+module.exports = { kMeans, findSaddle, centerVectors, densityAt, typicalDensity, voidScore, approxB0, approxB1, nearestMessages, cosDistArr };
